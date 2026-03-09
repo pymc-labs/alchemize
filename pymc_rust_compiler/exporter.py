@@ -16,7 +16,6 @@ try:
     from pytensor.graph.traversal import graph_inputs
 except ImportError:
     from pytensor.graph.basic import graph_inputs
-from pytensor.printing import debugprint
 from pytensor.tensor import TensorConstant
 
 
@@ -52,6 +51,7 @@ class ModelContext:
     param_order: list[str]
     n_params: int
     logp_graph: str
+    dlogp_graph: str
     logp_terms: dict[str, str]
     observed_data: dict[str, dict]
     covariate_data: dict[str, dict]  # predictor/input data (e.g. x in regression)
@@ -75,6 +75,7 @@ class ModelContext:
             "param_order": self.param_order,
             "n_params": self.n_params,
             "logp_graph": self.logp_graph,
+            "dlogp_graph": self.dlogp_graph,
             "logp_terms": self.logp_terms,
             "observed_data": self.observed_data,
             "covariate_data": self.covariate_data,
@@ -148,16 +149,6 @@ class RustModelExporter:
         param_order = [v.name for v in model.value_vars]
         n_params = sum(p.size for p in params)
 
-        logp_graph = _capture_debugprint(model.logp())
-
-        logp_terms = {}
-        for rv in model.free_RVs:
-            term = model.logp(vars=[rv], sum=False)
-            logp_terms[rv.name] = _capture_debugprint(term)
-        for rv in model.observed_RVs:
-            term = model.logp(vars=[rv], sum=False)
-            logp_terms[rv.name] = _capture_debugprint(term)
-
         observed_data = {}
         for rv in model.observed_RVs:
             obs = model.rvs_to_values[rv]
@@ -185,13 +176,23 @@ class RustModelExporter:
         # These are non-scalar TensorConstants that aren't observed data
         covariate_data = self._extract_covariates(model, observed_data)
 
+        # Compile and extract optimized graphs (PyTensor optimization removes cruft)
         logp_fn = model.compile_logp()
         dlogp_fn = model.compile_dlogp()
+        logp_graph = _capture_fgraph(logp_fn.f.maker.fgraph)
+        dlogp_graph = _capture_fgraph(dlogp_fn.f.maker.fgraph)
+
+        # Per-RV logp terms (also optimized)
+        logp_terms = {}
+        all_rvs = list(model.free_RVs) + list(model.observed_RVs)
+        for rv in all_rvs:
+            rv_fn = model.compile_logp(vars=[rv], sum=False)
+            logp_terms[rv.name] = _capture_fgraph(rv_fn.f.maker.fgraph)
+
         test_point = model.initial_point()
 
-        # Compute per-RV logp for debugging
+        # Compute per-RV logp for debugging (reuse compiled per-RV functions)
         per_rv_logp_fns = {}
-        all_rvs = list(model.free_RVs) + list(model.observed_RVs)
         for rv in all_rvs:
             per_rv_logp_fns[rv.name] = model.compile_logp(vars=[rv])
 
@@ -233,6 +234,7 @@ class RustModelExporter:
             param_order=param_order,
             n_params=n_params,
             logp_graph=logp_graph,
+            dlogp_graph=dlogp_graph,
             logp_terms=logp_terms,
             observed_data=observed_data,
             covariate_data=covariate_data,
@@ -537,9 +539,11 @@ class RustModelExporter:
                         parts.append(f"- {hint}")
             parts.append("")
 
-        parts.append(f"## PyTensor Computational Graph (logp)\n```\n{ctx.logp_graph}\n```\n")
+        parts.append(f"## Optimized PyTensor Graph (logp)\n```\n{ctx.logp_graph}\n```\n")
 
-        parts.append("## Individual logp terms\n")
+        parts.append(f"## Optimized PyTensor Graph (dlogp/gradient)\n```\n{ctx.dlogp_graph}\n```\n")
+
+        parts.append("## Individual logp terms (optimized, per RV)\n")
         for name, term in ctx.logp_terms.items():
             display = term[:2000] + ("..." if len(term) > 2000 else "")
             parts.append(f"### {name}\n```\n{display}\n```\n")
@@ -632,10 +636,11 @@ mod tests {
         (output_dir / "validation_test.rs").write_text(self.to_rust_tests())
 
 
-def _capture_debugprint(var) -> str:
+def _capture_fgraph(fgraph) -> str:
+    """Capture the dprint output of an optimized FunctionGraph."""
     old_stdout = sys.stdout
     sys.stdout = buffer = io.StringIO()
-    debugprint(var, print_type=True)
+    fgraph.dprint()
     sys.stdout = old_stdout
     return buffer.getvalue()
 
