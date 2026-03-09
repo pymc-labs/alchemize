@@ -13,3 +13,7 @@ anyhow = "1"
 [[bin]]
 name = "validate"
 path = "src/validate.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"

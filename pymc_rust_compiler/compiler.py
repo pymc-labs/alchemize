@@ -211,6 +211,9 @@ class CompilationResult:
     timings: dict[str, float]
     n_tool_calls: int = 0
     conversation_turns: int = 0
+    token_usage: dict[str, int] = field(default_factory=lambda: {
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+    })
 
     @property
     def success(self) -> bool:
@@ -308,6 +311,9 @@ def compile_model(
     if verbose:
         print("\nStarting agent loop...")
 
+    total_input_tokens = 0
+    total_output_tokens = 0
+
     for turn in range(max_turns):
         # Call Claude
         t0 = time.time()
@@ -319,6 +325,13 @@ def compile_model(
             messages=state.messages,
         )
         timings[f"api_turn_{turn}"] = time.time() - t0
+
+        # Track token usage
+        if hasattr(response, "usage") and response.usage:
+            total_input_tokens += response.usage.input_tokens
+            total_output_tokens += response.usage.output_tokens
+            if verbose:
+                print(f"  Turn {turn}: {response.usage.input_tokens} in / {response.usage.output_tokens} out tokens")
 
         # Check stop reason
         if response.stop_reason == "end_turn":
@@ -378,6 +391,11 @@ def compile_model(
         timings=timings,
         n_tool_calls=state.tool_calls,
         conversation_turns=turn + 1 if 'turn' in dir() else 0,
+        token_usage={
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens,
+        },
     )
 
 
@@ -661,6 +679,10 @@ anyhow = "1"
 [[bin]]
 name = "validate"
 path = "src/validate.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"
 """
     (build_path / "Cargo.toml").write_text(cargo_toml)
 
@@ -715,3 +737,47 @@ fn main() {
 }
 """
     (src_dir / "validate.rs").write_text(validate_rs)
+
+    # Benchmark binary — tight loop logp+dlogp evaluations
+    bench_rs = """
+use pymc_compiled_model::generated::GeneratedLogp;
+use nuts_rs::CpuLogpFunc;
+use std::io::{self, BufRead};
+use std::time::Instant;
+
+fn main() {
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    // First line: number of iterations
+    let n_iters: usize = lines.next().unwrap().unwrap().trim().parse().unwrap();
+
+    // Second line: parameter vector
+    let param_line = lines.next().unwrap().unwrap();
+    let position: Vec<f64> = param_line.split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+
+    let mut logp_fn = GeneratedLogp;
+    let n = logp_fn.dim();
+    let mut gradient = vec![0.0f64; n];
+    let mut logp_val = 0.0f64;
+
+    // Warmup
+    for _ in 0..100 {
+        logp_val = logp_fn.logp(&position, &mut gradient).unwrap();
+    }
+
+    // Timed loop
+    let start = Instant::now();
+    for _ in 0..n_iters {
+        logp_val = logp_fn.logp(&position, &mut gradient).unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    let nanos = elapsed.as_nanos() as f64;
+    let us_per_eval = nanos / (n_iters as f64) / 1000.0;
+    println!("{:.6},{:.17e}", us_per_eval, logp_val);
+}
+"""
+    (src_dir / "bench.rs").write_text(bench_rs)
