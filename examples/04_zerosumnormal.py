@@ -180,11 +180,11 @@ if result.success:
         idata,
         var_names=["grand_mean", "sigma_store", "sigma_day", "sigma_cat", "sigma_y"],
         ref_val={
-            "grand_mean": true_grand_mean,
-            "sigma_store": true_sigma_store,
-            "sigma_day": true_sigma_day,
-            "sigma_cat": true_sigma_cat,
-            "sigma_y": true_sigma_y,
+            "grand_mean": [{"ref_val": true_grand_mean}],
+            "sigma_store": [{"ref_val": true_sigma_store}],
+            "sigma_day": [{"ref_val": true_sigma_day}],
+            "sigma_cat": [{"ref_val": true_sigma_cat}],
+            "sigma_y": [{"ref_val": true_sigma_y}],
         },
     )
     import matplotlib.pyplot as plt
