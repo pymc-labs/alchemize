@@ -15,19 +15,30 @@ PyMC Model → Extract logp graph + validation points → Claude API → Rust co
 
 The agent has four tools: `write_rust_code`, `cargo_build`, `validate_logp`, and `read_file`. It loops until the model compiles and validates correctly (up to 5 attempts).
 
-## Compilation benchmarks
+## Benchmarks
 
-Measured on Claude Sonnet 4 via the API:
+### Compilation (Claude Sonnet 4)
 
-| Model | Params | Builds | Tool Calls | Turns | Tokens | Result |
-|---|---|---|---|---|---|---|
-| Normal | 2 | 1 | 4 | 4 | 39K | First try |
-| Linear Regression | 3 | 1 | 4 | 4 | 52K | First try |
-| Hierarchical | 12 | 4 | 13 | 13 | 288K | Fixed gradients in 3 retries |
-| ZeroSumNormal | 124 | 1 | 5 | 5 | 213K | First try |
-| GP (ExpQuad) | 3 | 10 | 30 | 30 | 1.6M | Failed — Cholesky gradients |
+| Model | Params | Builds | Tokens | Result |
+|---|---|---|---|---|
+| Normal | 2 | 1 | 39K | First try |
+| Linear Regression | 3 | 1 | 52K | First try |
+| Hierarchical | 12 | 4 | 288K | Fixed gradients in 3 retries |
+| ZeroSumNormal | 124 | 1 | 213K | First try |
+| GP (ExpQuad) | 3 | 10 | 1.6M | Failed — Cholesky gradients |
 
-Simple models compile on the first attempt: read data → write code → build → validate, 4-5 tool calls. The ZeroSumNormal (124 params, rank-3 tensor with zero-sum constraints) also compiles first try. The hierarchical model needs a few gradient fixes. The GP model with Cholesky decomposition is the hardest — analytical gradients through matrix factorization remain a challenge for the agent.
+### Runtime: logp+dlogp evaluation speed
+
+Rust vs nutpie's Numba backend (500K evaluations, lower is better):
+
+| Model | Numba (us/eval) | Rust (us/eval) | Speedup |
+|---|---|---|---|
+| Normal (2 params) | 0.99 | 0.15 | **6.6x** |
+| LinReg (3 params) | 1.62 | 0.37 | **4.3x** |
+| Hierarchical (12 params) | 2.82 | 0.62 | **4.6x** |
+| GP regression (3 params) | 126.70 | 52.84 | **2.4x** |
+
+Numba column = `numba.cfunc` called from Rust in a tight loop (how nutpie actually works). The AI-compiled Rust is 2-7x faster across all models.
 
 ## Quick start
 
