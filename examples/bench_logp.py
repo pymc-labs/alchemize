@@ -68,11 +68,27 @@ def make_hierarchical_model():
     return model, str(build_dir)
 
 
+def make_gp_model():
+    """GP regression, 3 unconstrained parameters (log_ls, log_eta, log_sigma)."""
+    build_dir = Path("compiled_models/gp")
+    y_obs = np.load(build_dir / "y_data.npy")
+    x = np.load(build_dir / "x_0_data.npy")
+    with pm.Model() as model:
+        ls = pm.HalfNormal("ls", sigma=5)
+        eta = pm.HalfNormal("eta", sigma=5)
+        sigma = pm.HalfNormal("sigma", sigma=5)
+        cov = eta**2 * pm.gp.cov.ExpQuad(1, ls=ls)
+        gp = pm.gp.Marginal(cov_func=cov)
+        gp.marginal_likelihood("y", X=x[:, None], y=y_obs, sigma=sigma)
+    return model, str(build_dir)
+
+
 def main():
     models = [
         ("Normal (2 params)", make_normal_model),
         ("LinReg (3 params)", make_linreg_model),
         ("Hierarchical (12 params)", make_hierarchical_model),
+        ("GP regression (3 params)", make_gp_model),
     ]
 
     results = []
