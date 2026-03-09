@@ -25,8 +25,10 @@ class ParamInfo:
     name: str
     value_var: str
     transform: str | None
-    shape: list[int]
-    size: int
+    shape: list[int]       # original RV shape
+    unc_shape: list[int]   # unconstrained (value_var) shape
+    size: int              # unconstrained size
+    zerosum_axes: list[int] | None = None  # axes for ZeroSumTransform
 
     @property
     def is_scalar(self) -> bool:
@@ -38,6 +40,7 @@ class ValidationPoint:
     point: dict[str, list | float]
     logp: float
     dlogp: list[float]
+    per_rv_logp: dict[str, float] | None = None  # logp contribution per RV
 
 
 @dataclass
@@ -64,6 +67,7 @@ class ModelContext:
                     "value_var": p.value_var,
                     "transform": p.transform,
                     "shape": p.shape,
+                    "unc_shape": p.unc_shape,
                     "size": p.size,
                 }
                 for p in self.params
@@ -121,15 +125,23 @@ class RustModelExporter:
         for rv in model.free_RVs:
             value_var = model.rvs_to_values[rv]
             transform = model.rvs_to_transforms.get(rv, None)
-            shape = list(rv.type.shape) if hasattr(rv.type, "shape") else []
-            size = int(np.prod(shape)) if shape else 1
+            # Use value_var shape for unconstrained size (transforms may change dims)
+            rv_shape = list(rv.type.shape) if hasattr(rv.type, "shape") else []
+            unc_shape = list(value_var.type.shape) if hasattr(value_var.type, "shape") else []
+            size = int(np.prod(unc_shape)) if unc_shape else 1
+            zs_axes = None
+            if transform and type(transform).__name__ == "ZeroSumTransform":
+                zs_axes = list(transform.zerosum_axes)
+
             params.append(
                 ParamInfo(
                     name=rv.name,
                     value_var=value_var.name,
                     transform=type(transform).__name__ if transform else None,
-                    shape=shape,
+                    shape=rv_shape,
+                    unc_shape=unc_shape,
                     size=size,
+                    zerosum_axes=zs_axes,
                 )
             )
 
@@ -177,6 +189,15 @@ class RustModelExporter:
         dlogp_fn = model.compile_dlogp()
         test_point = model.initial_point()
 
+        # Compute per-RV logp for debugging
+        per_rv_logp_fns = {}
+        all_rvs = list(model.free_RVs) + list(model.observed_RVs)
+        for rv in all_rvs:
+            per_rv_logp_fns[rv.name] = model.compile_logp(vars=[rv])
+
+        def _per_rv_logp(point):
+            return {name: float(fn(point)) for name, fn in per_rv_logp_fns.items()}
+
         initial = ValidationPoint(
             point={
                 k: v.tolist() if hasattr(v, "tolist") else v
@@ -184,6 +205,7 @@ class RustModelExporter:
             },
             logp=float(logp_fn(test_point)),
             dlogp=dlogp_fn(test_point).tolist(),
+            per_rv_logp=_per_rv_logp(test_point),
         )
 
         rng = np.random.default_rng(self._seed)
@@ -379,16 +401,97 @@ class RustModelExporter:
         parts.append("## Parameter Layout (unconstrained space)")
         parts.append("The `position` slice contains these parameters in order:\n")
         offset = 0
+        has_zerosum = False
         for p in ctx.params:
             if p.is_scalar:
                 line = f"- position[{offset}] = {p.value_var}"
             else:
-                line = f"- position[{offset}..{offset + p.size}] = {p.value_var} (shape {p.shape})"
+                line = f"- position[{offset}..{offset + p.size}] = {p.value_var} (unconstrained shape {p.unc_shape})"
             if p.transform:
-                line += f"  [{p.transform} of {p.name}]"
+                line += f"  [{p.transform} of {p.name}, original shape {p.shape}]"
+                if p.transform == "ZeroSumTransform":
+                    has_zerosum = True
             parts.append(line)
             offset += p.size
         parts.append(f"\nTotal unconstrained parameters: {ctx.n_params}\n")
+
+        if has_zerosum:
+            parts.append("## ZeroSumTransform Details")
+            parts.append(
+                "ZeroSumTransform maps n-1 unconstrained params to n constrained params that sum to zero.\n"
+                "The log_jac_det of ZeroSumTransform is 0 (no Jacobian correction needed).\n\n"
+                "**Exact backward formula** (`extend_axis`) for a single axis with constrained size n:\n"
+                "Given unconstrained `x[0..n-2]` (length n-1), produce constrained `y[0..n-1]` (length n):\n"
+                "```rust\n"
+                "let n: f64 = constrained_size as f64;  // e.g. 6.0_f64 for shape=[6]\n"
+                "let sum_x: f64 = x.iter().sum();\n"
+                "let norm: f64 = sum_x / (n.sqrt() + n);\n"
+                "let fill: f64 = norm - sum_x / n.sqrt();\n"
+                "y[i] = x[i] - norm    // for i in 0..n-2\n"
+                "y[n-1] = fill - norm  // the last element\n"
+                "// Guarantee: y.iter().sum() ≈ 0.0\n"
+                "// IMPORTANT: Always use f64 type annotations or _f64 suffix for n!\n"
+                "```\n\n"
+                "**Multi-axis ZeroSumTransform** (`n_zerosum_axes > 1`):\n"
+                "When applied to multiple axes (e.g., axes [-2, -1] for a 3D array),\n"
+                "the transform is applied sequentially: first extend axis -2, then extend axis -1.\n"
+                "Each `extend_axis` call independently adds one element along that axis.\n"
+                "For example, shape (6,7,4) with zerosum_axes=[-2,-1]:\n"
+                "  unconstrained: (6, 6, 3) → after extend axis -2: (6, 7, 3) → after extend axis -1: (6, 7, 4)\n\n"
+                "**CRITICAL: ZeroSumNormal logp uses UNCONSTRAINED element count, not constrained!**\n"
+                "ZeroSumNormal evaluates Normal(0, sigma) logp for only n_unconstrained elements\n"
+                "(not the full constrained array). The last element per sum-to-zero axis is deterministic\n"
+                "and does NOT contribute a logp term.\n\n"
+                "The logp is computed on the UNCONSTRAINED values directly:\n"
+                "```\n"
+                "logp = sum over all unconstrained elements x_i of:\n"
+                "    -0.5*log(2*pi) - log(sigma) - 0.5*(x_i/sigma)^2\n"
+                "```\n"
+                "This means the gradient w.r.t. log(sigma) uses N_UNCONSTRAINED, not N_CONSTRAINED:\n"
+                "```\n"
+                "d(logp)/d(log_sigma) = (-N_unc/sigma + sum(x_i^2)/sigma^3) * sigma\n"
+                "                     = -N_unc + sum(x_i^2)/sigma^2\n"
+                "```\n"
+                "And the gradient w.r.t. unconstrained x_i is simply:\n"
+                "```\n"
+                "d(logp)/d(x_i) = -x_i/sigma^2\n"
+                "```\n"
+                "NO ZeroSumTransform backward/gradient needed! The logp is evaluated directly\n"
+                "on the unconstrained parameters. The only place you need the backward transform\n"
+                "is for computing the OBSERVED LIKELIHOOD (mu = ... + effect[idx] where effect\n"
+                "is the constrained version).\n\n"
+            )
+
+            # Show specific ZeroSum params
+            for p in ctx.params:
+                if p.transform == "ZeroSumTransform":
+                    n_unc = int(np.prod(p.unc_shape))
+                    n_con = int(np.prod(p.shape))
+                    parts.append(
+                        f"- `{p.name}`: constrained shape {p.shape} ({n_con} elements), "
+                        f"unconstrained shape {p.unc_shape} ({n_unc} elements), "
+                        f"zerosum_axes={p.zerosum_axes}\n"
+                        f"  → logp uses {n_unc} Normal terms (NOT {n_con}!)\n"
+                        f"  → gradient w.r.t. sigma uses -({n_unc}/sigma + ...) (NOT -{n_con}/sigma)"
+                    )
+            parts.append("")
+
+            parts.append(
+                "**Computing constrained values for the likelihood:**\n"
+                "You still need the constrained (full) values for the observed likelihood.\n"
+                "Apply `extend_axis` sequentially for each zerosum axis.\n\n"
+                "**Gradient of likelihood through ZeroSumTransform (per axis):**\n"
+                "If `dlogp_dy[i]` is the gradient w.r.t. constrained y along one axis (constrained size n),\n"
+                "the gradient w.r.t. unconstrained x (size n-1) is:\n"
+                "```rust\n"
+                "let n: f64 = constrained_size as f64;  // use _f64 suffix or type annotation!\n"
+                "let sum_grad: f64 = dlogp_dy[0..n-1].iter().sum();\n"
+                "let grad_fill: f64 = dlogp_dy[n-1];\n"
+                "dlogp_dx[j] = dlogp_dy[j] - sum_grad / (n.sqrt() + n) - grad_fill / n.sqrt();\n"
+                "// for j in 0..n-2\n"
+                "```\n"
+                "For multi-axis, apply the gradient transform in reverse order of axes.\n"
+            )
 
         # List all data available in data.rs
         all_data = {}
@@ -446,6 +549,10 @@ class RustModelExporter:
 
         parts.append(f"At initial point: {json.dumps(ctx.initial_point.point)}")
         parts.append(f"- logp = {ctx.initial_point.logp:.10f}")
+        if ctx.initial_point.per_rv_logp:
+            parts.append("- logp decomposition per RV (use this to debug each term):")
+            for rv_name, rv_logp in ctx.initial_point.per_rv_logp.items():
+                parts.append(f"    {rv_name}: {rv_logp:.10f}")
         parts.append(f"- gradient = {ctx.initial_point.dlogp}\n")
 
         for i, pt in enumerate(ctx.extra_points):
@@ -485,14 +592,18 @@ mod tests {
             (f"point_{i + 1}", p) for i, p in enumerate(ctx.extra_points)
         ]
 
+        def _flatten(v):
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    yield from _flatten(item)
+            else:
+                yield float(v)
+
         for test_name, vp in all_points:
             position = []
             for name in ctx.param_order:
                 val = vp.point[name]
-                if isinstance(val, list):
-                    position.extend(val)
-                else:
-                    position.append(val)
+                position.extend(_flatten(val))
 
             tests.append(f"""
     #[test]

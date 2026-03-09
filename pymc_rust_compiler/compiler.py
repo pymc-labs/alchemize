@@ -36,14 +36,15 @@ CRITICAL RULES:
 1. Parameters are in UNCONSTRAINED space (log-transforms for positive parameters)
 2. Include the Jacobian adjustment for any transforms (e.g., +log_sigma for LogTransform)
 3. The gradient must be analytically correct - NUTS relies on this
-4. Do NOT include constant terms that don't depend on parameters (e.g. -0.5*log(2*pi) per observation)
+4. Include ALL terms in the logp — PyMC includes everything, including -0.5*log(2*pi) and -log(sigma).
+   Your output MUST match PyMC's logp exactly. Do NOT drop any terms.
 5. Use efficient single-pass computation where possible
 6. All data (observed + covariates/predictors) is provided in `data.rs` — use `use crate::data::*;` to access it. Do NOT embed data arrays in your generated code.
 
 IMPORTANT - OBSERVED DATA LIKELIHOOD:
 The logp MUST include the log-likelihood of ALL observed data points. This is typically the
 dominant term. For example, if y ~ Normal(mu, sigma) is observed with N data points, the logp
-must include: sum over i of [-0.5 * ((y[i] - mu[i]) / sigma)^2 - log(sigma)] for all N observations.
+must include: sum over i of [-0.5*log(2*pi) - log(sigma) - 0.5 * ((y[i] - mu[i]) / sigma)^2] for all N observations.
 Forgetting the observed likelihood is the #1 error — the logp from priors alone is much smaller
 than the total logp including observations.
 
@@ -52,16 +53,18 @@ When a data array is labeled as an INTEGER INDEX ARRAY, cast its elements to `us
 indexing. For example: `let group = X_1_DATA[i] as usize;` then use `a[group]` to index into
 group-level parameter arrays.
 
-IMPORTANT: Constant terms like -n/2*log(2*pi) and -log(scale) for priors are DROPPED by PyMC
-when computing the logp. Do NOT include them. Only include terms that depend on the parameters.
+EXACT LOG-DENSITY FORMULAS (include ALL terms, PyMC drops nothing):
 
-For LogTransform (HalfNormal, etc.):
-- The unconstrained parameter is log(x)
-- The constrained value is x = exp(log_x)
-- The Jacobian adjustment adds +log_x to the logp
-- The prior logp for HalfNormal(scale) in unconstrained space (dropping constants):
-  logp = -x^2 / (2 * scale^2) + log_x
-  d(logp)/d(log_x) = -x^2 / scale^2 + 1
+Normal(x | mu, sigma):
+  logp = -0.5*log(2*pi) - log(sigma) - 0.5*((x-mu)/sigma)^2
+  d(logp)/d(x) = -(x-mu)/sigma^2
+  d(logp)/d(sigma) = -1/sigma + (x-mu)^2/sigma^3
+  d(logp)/d(mu) = (x-mu)/sigma^2
+
+HalfNormal(x | sigma) with LogTransform (unconstrained param = log_x):
+  x = exp(log_x)
+  logp = log(2) - 0.5*log(2*pi) - log(sigma) - 0.5*(x/sigma)^2 + log_x
+  d(logp)/d(log_x) = -x^2/sigma^2 + 1
 
 You MUST output a COMPLETE, compilable Rust file (generated.rs). Use this structure:
 
@@ -141,7 +144,7 @@ def compile_model(
     model: pm.Model,
     source_code: str | None = None,
     api_key: str | None = None,
-    max_attempts: int = 3,
+    max_attempts: int = 5,
     model_name: str = "claude-sonnet-4-20250514",
     build_dir: str | Path | None = None,
     verbose: bool = True,
@@ -421,15 +424,23 @@ def _validate_logp(build_path: Path, ctx) -> tuple[bool, list[str]]:
         (f"extra_{i}", p) for i, p in enumerate(ctx.extra_points)
     ]
 
+    def _flatten(v):
+        """Recursively flatten nested lists/arrays to scalar floats."""
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                yield from _flatten(item)
+        elif hasattr(v, '__iter__') and not isinstance(v, str):
+            for item in v:
+                yield from _flatten(item)
+        else:
+            yield float(v)
+
     input_lines = []
     for name, vp in all_points:
         position = []
         for param_name in ctx.param_order:
             val = vp.point[param_name]
-            if isinstance(val, list):
-                position.extend(val)
-            else:
-                position.append(val)
+            position.extend(_flatten(val))
         input_lines.append(",".join(f"{v:.17e}" for v in position))
 
     stdin_data = "\n".join(input_lines) + "\n"
