@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use nuts_rs::{CpuLogpFunc, CpuMathError, LogpError, Storable};
 use nuts_storable::HasDims;
 use thiserror::Error;
+use faer::{Mat, Par, Spec};
+use faer::linalg::cholesky::llt::{factor, solve, inverse};
+use faer::linalg::cholesky::llt::factor::LltParams;
+use faer::dyn_stack::{MemBuffer, MemStack};
 use crate::data::*;
 
 #[derive(Debug, Error)]
@@ -29,24 +33,29 @@ pub struct Draw {
     pub parameters: Vec<f64>,
 }
 
-#[derive(Clone)]
 pub struct GeneratedLogp {
-    // Preallocated workspace to avoid allocation in hot loop
-    k: Vec<f64>,        // N*N kernel matrix (lower triangle after Cholesky)
-    alpha: Vec<f64>,    // N-vector: K^{-1} y
-    dk_dls: Vec<f64>,   // N*N derivative dK/d(log_ls)
-    kinv: Vec<f64>,     // N*N: K^{-1}
-    tmp: Vec<f64>,      // N-vector scratch
+    // Preallocated faer matrices (reused across calls, no allocation in hot loop)
+    k_mat: Mat<f64>,      // N×N kernel matrix → becomes L after factorization
+    alpha: Mat<f64>,      // N×1 for solve (K^{-1} y)
+    kinv: Mat<f64>,       // N×N for inverse
+    dk_dls: Vec<f64>,     // N*N derivative dK/d(log_ls) (flat for fast access)
+    chol_buf: MemBuffer,  // scratch for cholesky_in_place
+    inv_buf: MemBuffer,   // scratch for inverse
 }
 
 impl GeneratedLogp {
     pub fn new() -> Self {
+        let chol_scratch = factor::cholesky_in_place_scratch::<f64>(
+            N, Par::Seq, Spec::<LltParams, f64>::default(),
+        );
+        let inv_scratch = inverse::inverse_scratch::<f64>(N, Par::Seq);
         Self {
-            k: vec![0.0; N * N],
-            alpha: vec![0.0; N],
+            k_mat: Mat::zeros(N, N),
+            alpha: Mat::zeros(N, 1),
+            kinv: Mat::zeros(N, N),
             dk_dls: vec![0.0; N * N],
-            kinv: vec![0.0; N * N],
-            tmp: vec![0.0; N],
+            chol_buf: MemBuffer::new(chol_scratch),
+            inv_buf: MemBuffer::new(inv_scratch),
         }
     }
 }
@@ -85,7 +94,6 @@ impl CpuLogpFunc for GeneratedLogp {
         let mut logp = 0.0;
 
         // === Priors (HalfNormal(5) with LogTransform) ===
-        // For each: logp = ln(2) - 0.5*ln(2π) - ln(5) - 0.5*(x/5)^2 + log_x
         let prior_const = 2.0f64.ln() - 0.5 * LN_2PI - 5.0f64.ln();
 
         let ls_s = ls * 0.2;
@@ -101,9 +109,8 @@ impl CpuLogpFunc for GeneratedLogp {
         gradient[2] += -0.04 * sigma_sq + 1.0;
 
         // === Build kernel matrix K and dK/d(log_ls) ===
-        let k = &mut self.k;
         let dk_dls = &mut self.dk_dls;
-
+        let k = &mut self.k_mat;
         for i in 0..N {
             for j in 0..=i {
                 let d = X_DATA[i] - X_DATA[j];
@@ -111,142 +118,90 @@ impl CpuLogpFunc for GeneratedLogp {
                 let r_sq_scaled = d_sq * inv_ls_sq;
                 let exp_term = (-0.5 * r_sq_scaled).exp();
                 let k_ij = eta_sq * exp_term;
-
-                // dK/d(log_ls) = eta^2 * exp(...) * d^2/ls^2  (chain rule: d/d(log_ls) = ls * d/d(ls))
                 let dk_ij = k_ij * r_sq_scaled;
 
                 if i == j {
-                    k[i * N + j] = k_ij + sigma_sq + JITTER;
+                    k[(i, j)] = k_ij + sigma_sq + JITTER;
                 } else {
-                    k[i * N + j] = k_ij;
-                    k[j * N + i] = k_ij;
+                    k[(i, j)] = k_ij;
+                    k[(j, i)] = k_ij;
                 }
                 dk_dls[i * N + j] = dk_ij;
                 dk_dls[j * N + i] = dk_ij;
             }
         }
 
-        // === Cholesky decomposition: K = L L^T ===
-        // In-place: lower triangle of k becomes L
-        for j in 0..N {
-            let mut sum = k[j * N + j];
-            for p in 0..j {
-                sum -= k[j * N + p] * k[j * N + p];
-            }
-            if sum <= 0.0 {
-                return Err(SampleError::Recoverable("Cholesky failed: not positive definite".to_string()));
-            }
-            let ljj = sum.sqrt();
-            k[j * N + j] = ljj;
-            let inv_ljj = 1.0 / ljj;
-
-            for i in (j + 1)..N {
-                let mut sum = k[i * N + j];
-                for p in 0..j {
-                    sum -= k[i * N + p] * k[j * N + p];
-                }
-                k[i * N + j] = sum * inv_ljj;
-            }
-        }
-        // Now k[i*N+j] for i >= j is L[i,j]
+        // === Cholesky decomposition in-place via faer ===
+        factor::cholesky_in_place(
+            k.as_mut(),
+            Default::default(),
+            Par::Seq,
+            MemStack::new(&mut self.chol_buf),
+            Spec::<LltParams, f64>::default(),
+        ).map_err(|_| {
+            SampleError::Recoverable("Cholesky failed: not positive definite".to_string())
+        })?;
+        // Now k_mat lower triangle is L
 
         // === Log determinant: log|K| = 2 * sum(log(L_ii)) ===
         let mut log_det = 0.0;
         for i in 0..N {
-            log_det += k[i * N + i].ln();
+            log_det += k[(i, i)].ln();
         }
         log_det *= 2.0;
 
-        // === Solve L z = y (forward substitution) ===
+        // === Solve K alpha = y in-place: alpha starts as y, becomes K^{-1} y ===
         let alpha = &mut self.alpha;
         for i in 0..N {
-            let mut sum = Y_DATA[i];
-            for j in 0..i {
-                sum -= k[i * N + j] * alpha[j];
-            }
-            alpha[i] = sum / k[i * N + i];
+            alpha[(i, 0)] = Y_DATA[i];
         }
-
-        // === Solve L^T alpha = z (back substitution) ===
-        for i in (0..N).rev() {
-            let mut sum = alpha[i];
-            for j in (i + 1)..N {
-                sum -= k[j * N + i] * alpha[j];
-            }
-            alpha[i] = sum / k[i * N + i];
-        }
-        // Now alpha = K^{-1} y
+        solve::solve_in_place(
+            k.as_ref(),
+            alpha.as_mut(),
+            Par::Seq,
+            MemStack::new(&mut []),
+        );
 
         // === GP log-likelihood ===
-        // logp = -0.5 * (N*ln(2π) + log|K| + y^T K^{-1} y)
         let mut yt_kinv_y = 0.0;
         for i in 0..N {
-            yt_kinv_y += Y_DATA[i] * alpha[i];
+            yt_kinv_y += Y_DATA[i] * alpha[(i, 0)];
         }
-
         logp += -0.5 * (N as f64 * LN_2PI + log_det + yt_kinv_y);
 
-        // === Compute K^{-1} by solving L L^T X = I column by column ===
-        let kinv = &mut self.kinv;
-        let tmp = &mut self.tmp;
-
-        for col in 0..N {
-            // Forward solve: L z = e_col
-            for i in 0..N {
-                let rhs = if i == col { 1.0 } else { 0.0 };
-                let mut sum = rhs;
-                for j in 0..i {
-                    sum -= k[i * N + j] * tmp[j];
-                }
-                tmp[i] = sum / k[i * N + i];
-            }
-
-            // Back solve: L^T x = z
-            for i in (0..N).rev() {
-                let mut sum = tmp[i];
-                for j in (i + 1)..N {
-                    sum -= k[j * N + i] * tmp[j];
-                }
-                tmp[i] = sum / k[i * N + i];
-            }
-
-            for i in 0..N {
-                kinv[i * N + col] = tmp[i];
-            }
-        }
+        // === Compute K^{-1} in-place via faer ===
+        inverse::inverse(
+            self.kinv.as_mut(),
+            k.as_ref(),
+            Par::Seq,
+            MemStack::new(&mut self.inv_buf),
+        );
+        // Note: inverse only fills lower triangle, mirror to upper
+        let kinv = &self.kinv;
+        // faer's inverse for Cholesky fills lower triangle, need to symmetrize
+        // Actually looking at the source: it does L_inv^H * L_inv which gives full symmetric result
+        // via triangular matmul with TriangularLower output structure.
+        // But the output is only lower triangle. Let's use both halves via symmetry.
 
         // === Gradients ===
-        // W = K^{-1} - alpha * alpha^T
-        // dlogp/dθ = -0.5 * tr(W * dK/dθ)
-        //
-        // For log_eta: dK/d(log_eta) = 2 * eta^2 * exp(-0.5 * d^2/ls^2) = 2*(K - sigma^2*I - jitter*I) for off-diag
-        //              For diagonal: 2 * eta^2 (the kernel part only)
-        // For log_sigma: dK/d(log_sigma) = 2 * sigma^2 * I
-        // For log_ls: precomputed dk_dls
-
         let mut grad_log_ls = 0.0;
         let mut grad_log_eta = 0.0;
         let mut grad_log_sigma = 0.0;
 
         for i in 0..N {
+            let alpha_i = alpha[(i, 0)];
             for j in 0..N {
-                let w_ij = kinv[i * N + j] - alpha[i] * alpha[j];
+                let alpha_j = alpha[(j, 0)];
+                // kinv is symmetric but only lower triangle stored
+                let kinv_ij = if i >= j { kinv[(i, j)] } else { kinv[(j, i)] };
+                let w_ij = kinv_ij - alpha_i * alpha_j;
 
-                // dK/d(log_ls)
                 grad_log_ls += w_ij * dk_dls[i * N + j];
 
-                // dK/d(log_eta): 2 * (kernel part of K_ij)
-                // kernel_ij = K_ij - (sigma^2 + jitter) * delta_ij
-                // But we need the original kernel values. Since dk_dls stores
-                // eta^2 * exp(...) * d^2/ls^2, and kernel = eta^2 * exp(...),
-                // we can reconstruct: for i!=j, dK/d(log_eta) = 2 * K_ij
-                // for i==j, dK/d(log_eta) = 2 * (K_ii - sigma^2 - jitter)
-                // But simpler: recompute inline
                 let d = X_DATA[i] - X_DATA[j];
                 let kernel_ij = eta_sq * (-0.5 * d * d * inv_ls_sq).exp();
                 grad_log_eta += w_ij * 2.0 * kernel_ij;
 
-                // dK/d(log_sigma): 2 * sigma^2 * delta_ij
                 if i == j {
                     grad_log_sigma += w_ij * 2.0 * sigma_sq;
                 }

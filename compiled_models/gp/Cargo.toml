@@ -9,6 +9,7 @@ nuts-storable = "0.2"
 rand = "0.10"
 thiserror = "2"
 anyhow = "1"
+faer = "0.24"
 
 [[bin]]
 name = "validate"
