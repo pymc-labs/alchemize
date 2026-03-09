@@ -21,11 +21,13 @@ Measured on Claude Sonnet 4 via the API:
 
 | Model | Params | Builds | Tool Calls | Turns | Tokens | Result |
 |---|---|---|---|---|---|---|
-| Normal | 2 | 1 | 4 | 4 | 38K | First try |
+| Normal | 2 | 1 | 4 | 4 | 39K | First try |
 | Linear Regression | 3 | 1 | 4 | 4 | 52K | First try |
-| Hierarchical | 12 | 3 | 10 | 10 | 201K | Fixed gradients in 2 retries |
+| Hierarchical | 12 | 4 | 13 | 13 | 288K | Fixed gradients in 3 retries |
+| ZeroSumNormal | 124 | 1 | 5 | 5 | 213K | First try |
+| GP (ExpQuad) | 3 | 10 | 30 | 30 | 1.6M | Failed — Cholesky gradients |
 
-Simple models (Normal, LinReg) compile on the first attempt: read data → write code → build → validate, 4 tool calls total. More complex models like the hierarchical model may need a few iterations to get gradients right — the typical failure mode is numerically incorrect gradients rather than compile errors.
+Simple models compile on the first attempt: read data → write code → build → validate, 4-5 tool calls. The ZeroSumNormal (124 params, rank-3 tensor with zero-sum constraints) also compiles first try. The hierarchical model needs a few gradient fixes. The GP model with Cholesky decomposition is the hardest — analytical gradients through matrix factorization remain a challenge for the agent.
 
 ## Quick start
 
