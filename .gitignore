@@ -8,6 +8,7 @@ pixi.lock
 
 # Rust build artifacts
 target/
+Cargo.lock
 
 # Secrets
 .env
