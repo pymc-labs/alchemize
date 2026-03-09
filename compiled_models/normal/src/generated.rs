@@ -15,6 +15,7 @@ impl LogpError for SampleError {
 }
 
 pub const N_PARAMS: usize = 2;
+const LN_2PI: f64 = 1.8378770664093453;
 
 #[derive(Storable, Clone)]
 pub struct Draw {
@@ -39,70 +40,71 @@ impl CpuLogpFunc for GeneratedLogp {
     fn dim(&self) -> usize { N_PARAMS }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, SampleError> {
-        // Extract parameters from unconstrained space
         let mu = position[0];
-        let sigma_log = position[1];
-        let sigma = sigma_log.exp();
+        let log_sigma = position[1];
+        let sigma = log_sigma.exp();
         
-        // Initialize gradients
-        gradient[0] = 0.0; // d/d_mu
-        gradient[1] = 0.0; // d/d_sigma_log
-        
-        let mut total_logp = 0.0;
-        
-        // Prior for mu ~ Normal(0, 10)
-        // logp = -0.5*log(2*pi) - log(10) - 0.5*((mu-0)/10)^2
-        let mu_centered = mu - 0.0;
-        let mu_scaled = mu_centered / 10.0;
-        let mu_logp = -0.5 * (2.0 * std::f64::consts::PI).ln() - 10.0_f64.ln() - 0.5 * mu_scaled * mu_scaled;
-        total_logp += mu_logp;
-        
-        // Gradient for mu prior: d/d_mu = -(mu-0)/10^2 = -mu/100
-        gradient[0] += -mu / 100.0;
-        
-        // Prior for sigma ~ HalfNormal(5) with LogTransform
-        // HalfNormal(x|scale) = 2 * Normal(x|0,scale) for x >= 0
-        // logp = log(2) - 0.5*log(2*pi) - log(5) - 0.5*(sigma/5)^2 + sigma_log (Jacobian)
-        let sigma_scaled = sigma / 5.0;
-        let sigma_logp = 2.0_f64.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() - 5.0_f64.ln() 
-                        - 0.5 * sigma_scaled * sigma_scaled + sigma_log;
-        total_logp += sigma_logp;
-        
-        // Gradient for sigma prior w.r.t. sigma_log:
-        // d/d_sigma_log = d/d_sigma * d_sigma/d_sigma_log = d/d_sigma * sigma
-        // d/d_sigma = -sigma/25, so d/d_sigma_log = -sigma^2/25 + 1
-        gradient[1] += -sigma * sigma / 25.0 + 1.0;
-        
-        // Likelihood for y ~ Normal(mu, sigma)
-        // For each observation: logp = -0.5*log(2*pi) - log(sigma) - 0.5*((y_i - mu)/sigma)^2
-        let log_2pi = (2.0 * std::f64::consts::PI).ln();
-        let log_sigma = sigma.ln();
-        let sigma_inv = 1.0 / sigma;
-        let sigma_inv_sq = sigma_inv * sigma_inv;
-        
-        let mut sum_residual_sq = 0.0;
-        let mut sum_residual = 0.0;
-        
-        for &y_i in Y_DATA {
-            let residual = y_i - mu;
-            let scaled_residual = residual * sigma_inv;
-            let y_logp_i = -0.5 * log_2pi - log_sigma - 0.5 * scaled_residual * scaled_residual;
-            total_logp += y_logp_i;
-            
-            sum_residual += residual;
-            sum_residual_sq += residual * residual;
+        // Check sigma > 0 (should always be true for exp, but keeping for safety)
+        if sigma <= 0.0 {
+            return Err(SampleError::Recoverable("sigma must be positive".to_string()));
         }
         
-        // Gradient contributions from likelihood
-        // d/d_mu = sum_i (y_i - mu) / sigma^2 = sum_residual / sigma^2
-        gradient[0] += sum_residual * sigma_inv_sq;
+        let mut logp = 0.0;
+        gradient[0] = 0.0;
+        gradient[1] = 0.0;
         
-        // d/d_sigma_log = d/d_sigma * sigma
-        // d/d_sigma = -N/sigma + sum_i (y_i - mu)^2 / sigma^3
-        // d/d_sigma_log = -N + sum_residual_sq / sigma^2
-        gradient[1] += -(Y_N as f64) + sum_residual_sq * sigma_inv_sq;
+        // Prior: mu ~ Normal(0, 10)
+        // logp = -0.5*log(2*pi) - log(10) - 0.5*((mu-0)/10)^2
+        let mu_prior_logp = -0.5 * LN_2PI - 10.0f64.ln() - 0.5 * (mu / 10.0).powi(2);
+        logp += mu_prior_logp;
         
-        Ok(total_logp)
+        // Gradient for mu prior
+        let grad_mu_prior = -mu / 100.0;  // d/dmu of -0.5*(mu/10)^2 = -mu/100
+        gradient[0] += grad_mu_prior;
+        
+        // Prior: sigma ~ HalfNormal(5) with LogTransform
+        // sigma = exp(log_sigma)
+        // HalfNormal(sigma | 5): logp = log(2) - 0.5*log(2*pi) - log(5) - 0.5*(sigma/5)^2
+        // With LogTransform Jacobian: +log_sigma
+        let sigma_prior_logp = 2.0f64.ln() - 0.5 * LN_2PI - 5.0f64.ln() - 0.5 * (sigma / 5.0).powi(2) + log_sigma;
+        logp += sigma_prior_logp;
+        
+        // Gradient for sigma prior (w.r.t. log_sigma)
+        // d/d(log_sigma) = -sigma^2/25 + 1
+        let grad_sigma_prior = -sigma * sigma / 25.0 + 1.0;
+        gradient[1] += grad_sigma_prior;
+        
+        // Likelihood: y ~ Normal(mu, sigma)
+        // For each observation: logp = -0.5*log(2*pi) - log(sigma) - 0.5*((y[i] - mu)/sigma)^2
+        
+        // Precompute constants for efficiency
+        let inv_sigma = 1.0 / sigma;
+        let inv_sigma_sq = inv_sigma * inv_sigma;
+        let log_norm_term = -0.5 * LN_2PI - log_sigma;  // -0.5*log(2*pi) - log(sigma)
+        
+        let mut grad_mu_obs = 0.0;
+        let mut grad_log_sigma_obs = 0.0;
+        
+        for i in 0..Y_N {
+            let y_i = Y_DATA[i];
+            let residual = y_i - mu;
+            
+            // Logp contribution from this observation
+            let obs_logp = log_norm_term - 0.5 * residual * residual * inv_sigma_sq;
+            logp += obs_logp;
+            
+            // Gradient contributions
+            // d/dmu = (y_i - mu) / sigma^2
+            grad_mu_obs += residual * inv_sigma_sq;
+            
+            // d/d(log_sigma) = -1 + (y_i - mu)^2 / sigma^2
+            grad_log_sigma_obs += -1.0 + residual * residual * inv_sigma_sq;
+        }
+        
+        gradient[0] += grad_mu_obs;
+        gradient[1] += grad_log_sigma_obs;
+        
+        Ok(logp)
     }
 
     fn expand_vector<R: rand::Rng + ?Sized>(

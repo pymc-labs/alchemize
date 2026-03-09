@@ -75,6 +75,67 @@ HalfNormal(x | sigma) with LogTransform (unconstrained param = log_x):
   logp = log(2) - 0.5*log(2*pi) - log(sigma) - 0.5*(x/sigma)^2 + log_x
   d(logp)/d(log_x) = -x^2/sigma^2 + 1
 
+PERFORMANCE OPTIMIZATION RULES (critical for competitive speed):
+
+1. HOIST INVARIANTS OUT OF THE OBSERVATION LOOP:
+   Precompute everything that doesn't depend on the observation index BEFORE the loop.
+   ```rust
+   // GOOD: precompute once
+   let inv_sigma_sq = 1.0 / (sigma * sigma);
+   let neg_log_sigma = -sigma.ln();  // or equivalently: -log_sigma_y for log-transformed params
+   let log_norm = -0.5 * LN_2PI + neg_log_sigma;  // constant per observation
+   for i in 0..N {
+       let residual = y[i] - mu[i];
+       logp += log_norm - 0.5 * residual * residual * inv_sigma_sq;
+   }
+   // BAD: recomputing inside loop
+   for i in 0..N {
+       logp += -0.5 * LN_2PI - sigma.ln() - 0.5 * ((y[i] - mu[i]) / sigma).powi(2);
+   }
+   ```
+
+2. USE MULTIPLY INSTEAD OF DIVIDE:
+   Replace `x / sigma` with `x * inv_sigma` — division is 5-20x slower than multiplication.
+   Precompute `inv_sigma = 1.0 / sigma` and `inv_sigma_sq = inv_sigma * inv_sigma`.
+
+3. USE SEPARATE GRADIENT ACCUMULATORS FOR AUTO-VECTORIZATION:
+   LLVM can auto-vectorize (SIMD) accumulation loops when the accumulator is a simple local
+   variable, not an indexed array write. Use local f64 accumulators, then write to gradient[] once.
+   ```rust
+   let mut grad_alpha = 0.0f64;
+   let mut grad_beta = 0.0f64;
+   let mut grad_log_sigma = 0.0f64;
+   for i in 0..N {
+       let r = (y[i] - mu_i) * inv_sigma_sq;
+       grad_alpha += r;
+       grad_beta += r * x[i];
+       grad_log_sigma += r * r * sigma * sigma - 1.0;  // or equivalent
+   }
+   gradient[0] += grad_alpha;
+   gradient[1] += grad_beta;
+   gradient[2] += grad_log_sigma;
+   ```
+
+4. FOR GROUP-LEVEL GRADIENT ACCUMULATION (hierarchical models):
+   Use a local fixed-size array for group gradient accumulators instead of writing to
+   gradient[] inside the loop. This enables LLVM to keep them in registers.
+   ```rust
+   let mut grad_offset = [0.0f64; N_GROUPS];
+   for i in 0..N {
+       let g = group_idx[i] as usize;
+       grad_offset[g] += residual_scaled;
+   }
+   for g in 0..N_GROUPS {
+       gradient[OFFSET + g] += grad_offset[g] * sigma_a;
+   }
+   ```
+
+5. AVOID .powi(2) in HOT LOOPS — use `x * x` instead. The compiler may not always optimize
+   `.powi(2)` to a simple multiply.
+
+6. PRECOMPUTE LOG CONSTANTS: For log-transformed parameters, `sigma.ln()` equals `log_sigma`
+   (the unconstrained parameter). Use `log_sigma` directly instead of calling `.ln()`.
+
 DEBUGGING TIPS:
 - If logp is way off, check that you included the observed likelihood (it dominates)
 - If gradient is wrong for a sigma parameter, check N_UNCONSTRAINED vs N_CONSTRAINED

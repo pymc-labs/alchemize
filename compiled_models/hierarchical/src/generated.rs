@@ -16,8 +16,6 @@ impl LogpError for SampleError {
 
 pub const N_PARAMS: usize = 12;
 
-const LN_2PI: f64 = 1.8378770664093454835606594728112; // ln(2π)
-
 #[derive(Storable, Clone)]
 pub struct Draw {
     #[storable(dims("param"))]
@@ -41,13 +39,10 @@ impl CpuLogpFunc for GeneratedLogp {
     fn dim(&self) -> usize { N_PARAMS }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, SampleError> {
-        // Clear gradient
-        gradient.fill(0.0);
-        
-        // Extract parameters
+        // Parameter extraction (unconstrained space)
         let mu_a = position[0];
         let log_sigma_a = position[1];
-        let a_offset = &position[2..10];  // 8 elements
+        let a_offset = &position[2..10]; // shape [8]
         let b = position[10];
         let log_sigma_y = position[11];
         
@@ -55,80 +50,94 @@ impl CpuLogpFunc for GeneratedLogp {
         let sigma_a = log_sigma_a.exp();
         let sigma_y = log_sigma_y.exp();
         
-        // Compute hierarchical parameters a = mu_a + sigma_a * a_offset
+        // Precompute constants and invariants
+        const LN_2PI: f64 = 1.8378770664093453;
+        
+        let mut logp = 0.0;
+        
+        // Initialize gradient
+        gradient.fill(0.0);
+        
+        // mu_a ~ Normal(0, 10)
+        // logp = -0.5*log(2*pi) - log(10) - 0.5*((mu_a - 0)/10)^2
+        let mu_a_normalized = mu_a * 0.1;
+        logp += -0.5 * LN_2PI - 10.0_f64.ln() - 0.5 * mu_a_normalized * mu_a_normalized;
+        gradient[0] += -mu_a * 0.01; // d/d(mu_a) = -(mu_a - 0) / 10^2
+        
+        // sigma_a ~ HalfNormal(5) with LogTransform
+        // x = exp(log_sigma_a), logp = log(2) - 0.5*log(2*pi) - log(5) - 0.5*(x/5)^2 + log_sigma_a
+        let sigma_a_normalized = sigma_a * 0.2;
+        logp += 2.0_f64.ln() - 0.5 * LN_2PI - 5.0_f64.ln() - 0.5 * sigma_a_normalized * sigma_a_normalized + log_sigma_a;
+        gradient[1] += -sigma_a * sigma_a * 0.04 + 1.0; // d/d(log_sigma_a)
+        
+        // a_offset ~ Normal(0, 1, shape=8)
+        // logp = sum over i of [-0.5*log(2*pi) - 0.5*a_offset[i]^2]
+        for i in 0..8 {
+            logp += -0.5 * LN_2PI - 0.5 * a_offset[i] * a_offset[i];
+            gradient[2 + i] += -a_offset[i]; // d/d(a_offset[i])
+        }
+        
+        // b ~ Normal(0, 10)
+        let b_normalized = b * 0.1;
+        logp += -0.5 * LN_2PI - 10.0_f64.ln() - 0.5 * b_normalized * b_normalized;
+        gradient[10] += -b * 0.01; // d/d(b)
+        
+        // sigma_y ~ HalfNormal(5) with LogTransform
+        let sigma_y_normalized = sigma_y * 0.2;
+        logp += 2.0_f64.ln() - 0.5 * LN_2PI - 5.0_f64.ln() - 0.5 * sigma_y_normalized * sigma_y_normalized + log_sigma_y;
+        gradient[11] += -sigma_y * sigma_y * 0.04 + 1.0; // d/d(log_sigma_y)
+        
+        // Precompute for observations: a = mu_a + sigma_a * a_offset
         let mut a = [0.0; 8];
         for i in 0..8 {
             a[i] = mu_a + sigma_a * a_offset[i];
         }
         
-        let mut total_logp = 0.0;
+        // y ~ Normal(a[group_idx] + b * x, sigma_y)
+        // Precompute invariants outside the loop
+        let inv_sigma_y = 1.0 / sigma_y;
+        let inv_sigma_y_sq = inv_sigma_y * inv_sigma_y;
+        let log_norm = -0.5 * LN_2PI - log_sigma_y;
         
-        // 1. mu_a ~ Normal(0, 10)
-        let mu_a_logp = -0.5 * LN_2PI - (10.0_f64).ln() - 0.5 * (mu_a / 10.0).powi(2);
-        total_logp += mu_a_logp;
-        gradient[0] = -mu_a / 100.0;
+        // Initialize accumulators for efficient gradient computation
+        let mut grad_mu_a = 0.0;
+        let mut grad_b = 0.0;
+        let mut grad_log_sigma_y = 0.0;
+        let mut grad_a_offset = [0.0; 8];
         
-        // 2. sigma_a ~ HalfNormal(5) with LogTransform (includes Jacobian)
-        let sigma_a_logp = (2.0_f64).ln() - 0.5 * LN_2PI - (5.0_f64).ln() 
-            - 0.5 * (sigma_a / 5.0).powi(2) + log_sigma_a;
-        total_logp += sigma_a_logp;
-        // For HalfNormal(sigma_a | scale) with LogTransform:
-        // d/d(log_sigma_a) = -sigma_a^2/scale^2 + 1 (Jacobian)
-        gradient[1] = -sigma_a * sigma_a / 25.0 + 1.0;
-        
-        // 3. a_offset ~ Normal(0, 1) for each of 8 groups
-        for i in 0..8 {
-            let offset_logp = -0.5 * LN_2PI - 0.5 * a_offset[i].powi(2);
-            total_logp += offset_logp;
-            gradient[2 + i] = -a_offset[i];
-        }
-        
-        // 4. b ~ Normal(0, 10)
-        let b_logp = -0.5 * LN_2PI - (10.0_f64).ln() - 0.5 * (b / 10.0).powi(2);
-        total_logp += b_logp;
-        gradient[10] = -b / 100.0;
-        
-        // 5. sigma_y ~ HalfNormal(5) with LogTransform (includes Jacobian)
-        let sigma_y_logp = (2.0_f64).ln() - 0.5 * LN_2PI - (5.0_f64).ln() 
-            - 0.5 * (sigma_y / 5.0).powi(2) + log_sigma_y;
-        total_logp += sigma_y_logp;
-        gradient[11] = -sigma_y * sigma_y / 25.0 + 1.0;
-        
-        // 6. Observed likelihood: y ~ Normal(a[group_idx] + b * x, sigma_y)
         for i in 0..Y_N {
             let group_idx = X_1_DATA[i] as usize;
-            let x = X_0_DATA[i];
-            let y = Y_DATA[i];
+            let x_val = X_0_DATA[i];
+            let y_val = Y_DATA[i];
             
-            let mu_i = a[group_idx] + b * x;
-            let residual = y - mu_i;
+            let mu_i = a[group_idx] + b * x_val;
+            let residual = y_val - mu_i;
+            let residual_scaled = residual * inv_sigma_y_sq;
             
-            let obs_logp = -0.5 * LN_2PI - log_sigma_y - 0.5 * (residual / sigma_y).powi(2);
-            total_logp += obs_logp;
+            // Add to logp
+            logp += log_norm - 0.5 * residual * residual * inv_sigma_y_sq;
             
-            // Gradients for observed likelihood
-            let d_residual = residual / (sigma_y * sigma_y);
-            
-            // d/d_mu_a (affects mu_i through a[group_idx])
-            gradient[0] += d_residual;
-            
-            // d/d_log_sigma_a (affects mu_i through a[group_idx])
-            // mu_i = a[group_idx] = mu_a + sigma_a * a_offset[group_idx]
-            // d(mu_i)/d(log_sigma_a) = d(mu_i)/d(sigma_a) * d(sigma_a)/d(log_sigma_a)
-            //                        = a_offset[group_idx] * sigma_a
-            gradient[1] += d_residual * a_offset[group_idx] * sigma_a;
-            
-            // d/d_a_offset[group_idx] (affects mu_i through a[group_idx])
-            gradient[2 + group_idx] += d_residual * sigma_a;
-            
-            // d/d_b (affects mu_i directly)
-            gradient[10] += d_residual * x;
-            
-            // d/d_log_sigma_y
-            gradient[11] += -1.0 + (residual / sigma_y).powi(2);
+            // Accumulate gradients
+            grad_mu_a += residual_scaled;
+            grad_b += residual_scaled * x_val;
+            grad_log_sigma_y += residual * residual * inv_sigma_y_sq - 1.0;
+            grad_a_offset[group_idx] += residual_scaled * sigma_a;
         }
         
-        Ok(total_logp)
+        // Add accumulated gradients
+        gradient[0] += grad_mu_a;
+        gradient[10] += grad_b;
+        gradient[11] += grad_log_sigma_y;
+        
+        // For sigma_a gradient: d/d(log_sigma_a) includes chain rule
+        let mut grad_log_sigma_a = 0.0;
+        for i in 0..8 {
+            grad_log_sigma_a += grad_a_offset[i] * a_offset[i];
+            gradient[2 + i] += grad_a_offset[i]; // d/d(a_offset[i])
+        }
+        gradient[1] += grad_log_sigma_a;
+        
+        Ok(logp)
     }
 
     fn expand_vector<R: rand::Rng + ?Sized>(
