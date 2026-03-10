@@ -5,13 +5,17 @@ This model contains a Gaussian Process. GP models require matrix operations
 
 ## Dependencies
 
-Add `faer = "0.24"` to Cargo.toml. faer is a pure-Rust linear algebra library
-with excellent performance (comparable to LAPACK).
+`faer = "0.24"` is already added to Cargo.toml automatically. faer is a pure-Rust
+linear algebra library with excellent performance (comparable to LAPACK).
 
-## Pre-allocated Struct Pattern
+## MANDATORY: Pre-allocated Struct with Default
 
-GP models MUST pre-allocate all matrices and scratch buffers in the struct.
-Matrix allocation per logp call is catastrophic for performance.
+GP models MUST pre-allocate all matrices and scratch buffers as struct fields.
+Creating Mat::zeros() or MemBuffer inside logp() allocates on every call — this is
+catastrophic for performance. The validate/bench binaries call `GeneratedLogp::default()`,
+so you MUST implement `Default`.
+
+**DO NOT use a unit struct.** Always use this pattern:
 
 ```rust
 use faer::{Mat, Par, Spec};
@@ -19,17 +23,20 @@ use faer::linalg::cholesky::llt::{factor, solve, inverse};
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::dyn_stack::{MemBuffer, MemStack};
 
+const LN_2PI: f64 = 1.8378770664093453;  // ln(2π) — use this EXACT value
+const JITTER: f64 = 1e-6;
+
 pub struct GeneratedLogp {
     k_mat: Mat<f64>,      // N×N kernel matrix (overwritten each call)
     alpha: Mat<f64>,      // N×1 for K^{-1} y
     kinv: Mat<f64>,       // N×N for inverse
-    dk_dparam: Vec<f64>,  // N*N flat storage for kernel derivatives
+    dk_dls: Vec<f64>,     // N*N flat storage for dK/d(log_ls)
     chol_buf: MemBuffer,  // scratch for cholesky_in_place
     inv_buf: MemBuffer,   // scratch for inverse
 }
 
-impl GeneratedLogp {
-    pub fn new() -> Self {
+impl Default for GeneratedLogp {
+    fn default() -> Self {
         let chol_scratch = factor::cholesky_in_place_scratch::<f64>(
             N, Par::Seq, Spec::<LltParams, f64>::default(),
         );
@@ -38,7 +45,7 @@ impl GeneratedLogp {
             k_mat: Mat::zeros(N, N),
             alpha: Mat::zeros(N, 1),
             kinv: Mat::zeros(N, N),
-            dk_dparam: vec![0.0; N * N],
+            dk_dls: vec![0.0; N * N],
             chol_buf: MemBuffer::new(chol_scratch),
             inv_buf: MemBuffer::new(inv_scratch),
         }
@@ -104,8 +111,9 @@ let kinv_ij = if i >= j { self.kinv[(i, j)] } else { self.kinv[(j, i)] };
 
 For y ~ MvNormal(0, K):
 ```
-logp = -0.5 * (N * log(2π) + log|K| + y^T K^{-1} y)
+logp = -0.5 * (N * LN_2PI + log|K| + y^T K^{-1} y)
 ```
+where LN_2PI = 1.8378770664093453 (use this exact constant).
 
 ## GP Gradients
 
@@ -116,7 +124,10 @@ d(logp)/dθ = -0.5 * tr((K^{-1} - α α^T) dK/dθ)
 where α = K^{-1} y. Compute element-wise:
 ```rust
 for i in 0..N {
+    let alpha_i = self.alpha[(i, 0)];
     for j in 0..N {
+        let alpha_j = self.alpha[(j, 0)];
+        let kinv_ij = if i >= j { self.kinv[(i, j)] } else { self.kinv[(j, i)] };
         let w_ij = kinv_ij - alpha_i * alpha_j;
         grad_theta += w_ij * dk_dtheta[i * N + j];
     }
@@ -145,5 +156,35 @@ Always add a small jitter (1e-6) to the diagonal for numerical stability:
 ```rust
 const JITTER: f64 = 1e-6;
 // When building K:
-if i == j { k[(i,j)] = kernel_ij + sigma_sq + JITTER; }
+if i == j { self.k_mat[(i,j)] = kernel_ij + sigma_sq + JITTER; }
+```
+
+## Building the Kernel Matrix (complete pattern)
+
+Use `self.k_mat` and `self.dk_dls` — never allocate new matrices:
+```rust
+let eta_sq = eta * eta;
+let inv_ls_sq = 1.0 / (ls * ls);
+let sigma_sq = sigma * sigma;
+
+for i in 0..N {
+    for j in 0..=i {
+        let d = X_DATA[i] - X_DATA[j];
+        let d_sq = d * d;
+        let r_sq_scaled = d_sq * inv_ls_sq;
+        let exp_term = (-0.5 * r_sq_scaled).exp();
+        let k_ij = eta_sq * exp_term;
+
+        // Store dK/d(log_ls) for gradient computation
+        self.dk_dls[i * N + j] = k_ij * r_sq_scaled;
+        self.dk_dls[j * N + i] = self.dk_dls[i * N + j];
+
+        if i == j {
+            self.k_mat[(i, j)] = k_ij + sigma_sq + JITTER;
+        } else {
+            self.k_mat[(i, j)] = k_ij;
+            self.k_mat[(j, i)] = k_ij;
+        }
+    }
+}
 ```
