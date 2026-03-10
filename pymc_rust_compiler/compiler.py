@@ -140,20 +140,25 @@ PERFORMANCE OPTIMIZATION RULES (critical for competitive speed):
 
 7. PRE-ALLOCATE SCRATCH ARRAYS IN THE STRUCT (zero allocation in logp):
    Any arrays needed during logp evaluation should be stored as fields in `GeneratedLogp`
-   and initialized once in `GeneratedLogp::new()`. NEVER use `vec![]` or `Vec::new()` inside
-   `logp()` — heap allocation per call destroys performance. Use stack-allocated fixed arrays
-   `[0.0; N]` for small sizes (< 64 elements) or struct fields for larger ones.
+   and reused across calls. NEVER use `vec![]` or `Vec::new()` inside `logp()` — heap
+   allocation per call destroys performance. Use stack-allocated fixed arrays `[0.0; N]`
+   for small sizes (< 64 elements) or struct fields for larger ones.
+   When using struct fields, implement Default:
    ```rust
    pub struct GeneratedLogp {
        scratch: Vec<f64>,  // reused across calls
    }
-   impl GeneratedLogp {
-       pub fn new() -> Self { Self { scratch: vec![0.0; N] } }
+   impl Default for GeneratedLogp {
+       fn default() -> Self { Self { scratch: vec![0.0; N] } }
    }
-   // In logp(): just zero and reuse self.scratch
+   // The validate/bench binaries call GeneratedLogp::default()
+   // In logp(): just zero self.scratch and reuse it
    ```
+   For simple models with no heap-allocated scratch, use `#[derive(Clone, Default)]`.
 
 DEBUGGING TIPS:
+- IMPORTANT: Define `const LN_2PI: f64 = 1.8378770664093453;` (this is ln(2π)).
+  Do NOT compute it as `LN_2 * PI` — that gives ln(2)*π ≈ 2.177, which is WRONG.
 - If logp is way off, check that you included the observed likelihood (it dominates)
 - If gradient is wrong for a sigma parameter, check N_UNCONSTRAINED vs N_CONSTRAINED
 - Use `read_file` to inspect data.rs to confirm array names and sizes
@@ -185,7 +190,7 @@ pub struct Draw {
     pub parameters: Vec<f64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct GeneratedLogp;
 
 impl HasDims for GeneratedLogp {
@@ -868,7 +873,7 @@ use nuts_rs::CpuLogpFunc;
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    let mut logp_fn = GeneratedLogp;
+    let mut logp_fn = GeneratedLogp::default();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -920,7 +925,7 @@ fn main() {
         .map(|s| s.trim().parse().unwrap())
         .collect();
 
-    let mut logp_fn = GeneratedLogp;
+    let mut logp_fn = GeneratedLogp::default();
     let n = logp_fn.dim();
     let mut gradient = vec![0.0f64; n];
     let mut logp_val = 0.0f64;
