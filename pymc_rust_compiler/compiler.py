@@ -283,25 +283,46 @@ TOOLS = [
 ]
 
 
-def _detect_skills(model: pm.Model, ctx) -> list[str]:
+@functools.lru_cache(maxsize=1)
+def _cuda_available() -> bool:
+    """Check if CUDA is available at runtime."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"], capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _detect_skills(model: pm.Model, ctx, use_cuda: bool | None = None) -> list[str]:
     """Detect which skills are needed based on model structure.
 
     Returns a list of skill names (matching filenames in skills/).
+    If use_cuda is None, auto-detect CUDA availability.
     """
     skills = []
+    has_gp = False
 
     # GP: detect MvNormal or gp_ variables in the model
     for rv in list(model.free_RVs) + list(model.observed_RVs):
         op_name = type(rv.owner.op).__name__ if rv.owner else ""
         if "MvNormal" in op_name or "GP" in op_name:
-            skills.append("gp")
+            has_gp = True
             break
     # Also check the logp graph text for GP indicators
-    if "gp" not in skills and any(
+    if not has_gp and any(
         kw in ctx.logp_graph.lower()
         for kw in ["cholesky", "mvnormal", "gp_"]
     ):
-        skills.append("gp")
+        has_gp = True
+
+    if has_gp:
+        cuda = use_cuda if use_cuda is not None else _cuda_available()
+        if cuda:
+            skills.append("gp_cuda")
+        else:
+            skills.append("gp")
 
     # ZeroSumNormal: detect ZeroSumTransform
     for p in ctx.params:
@@ -334,6 +355,7 @@ def _build_system_prompt(skills: list[str]) -> str:
 # Extra Cargo.toml dependencies needed per skill
 _SKILL_CARGO_DEPS: dict[str, dict[str, str]] = {
     "gp": {"faer": "0.24"},
+    "gp_cuda": {"cudarc": '{ version = "0.12", features = ["cublas", "cusolver"] }'},
 }
 
 
@@ -381,6 +403,7 @@ def compile_model(
     model_name: str = "claude-sonnet-4-20250514",
     build_dir: str | Path | None = None,
     verbose: bool = True,
+    use_cuda: bool | None = None,
 ) -> CompilationResult:
     """Compile a PyMC model to optimized Rust via an agentic Claude loop.
 
@@ -420,7 +443,7 @@ def compile_model(
         print(f"  {ctx.n_params} parameters, {len(prompt)} char prompt")
 
     # Detect model-specific skills and build augmented system prompt
-    skills = _detect_skills(model, ctx)
+    skills = _detect_skills(model, ctx, use_cuda=use_cuda)
     system_prompt = _build_system_prompt(skills)
     if verbose and skills:
         print(f"  Skills loaded: {', '.join(skills)}")
@@ -821,7 +844,10 @@ def _setup_rust_project(
         'anyhow = "1"',
     ]
     for dep_name, dep_version in (extra_cargo_deps or {}).items():
-        deps_lines.append(f'{dep_name} = "{dep_version}"')
+        if dep_version.startswith("{"):
+            deps_lines.append(f'{dep_name} = {dep_version}')
+        else:
+            deps_lines.append(f'{dep_name} = "{dep_version}"')
 
     deps_block = "\n".join(deps_lines)
     cargo_toml = f"""[package]
@@ -1058,6 +1084,7 @@ def optimize_model(
     max_turns: int = 20,
     model_name: str = "claude-sonnet-4-20250514",
     verbose: bool = True,
+    use_cuda: bool | None = None,
 ) -> CompilationResult:
     """Optimize an already-compiled model's Rust code for speed.
 
@@ -1137,7 +1164,7 @@ def optimize_model(
         print(f"\nStarting optimization loop (build_dir={build_path})...")
 
     # Detect skills for system prompt augmentation
-    skills = _detect_skills(model, ctx)
+    skills = _detect_skills(model, ctx, use_cuda=use_cuda)
     system_prompt = OPTIMIZE_SYSTEM_PROMPT
     for skill_name in skills:
         content = _load_skill(skill_name)
