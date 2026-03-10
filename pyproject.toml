@@ -22,3 +22,8 @@ requires = ["hatchling"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["pymc_rust_compiler"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
