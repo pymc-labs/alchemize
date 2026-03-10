@@ -857,7 +857,7 @@ path = "src/bench.rs"
             _np.save(build_path / f"{name}_data.npy", _np.asarray(values))
 
     # lib.rs to expose modules
-    lib_rs = "pub mod data;\npub mod generated;\n"
+    lib_rs = "pub mod data;\npub mod generated;\npub use generated::*;\n"
     (src_dir / "lib.rs").write_text(lib_rs)
 
     # Placeholder generated.rs so the project structure is valid
@@ -943,7 +943,11 @@ fn main() {
 
     let nanos = elapsed.as_nanos() as f64;
     let us_per_eval = nanos / (n_iters as f64) / 1000.0;
-    println!("{:.6},{:.17e}", us_per_eval, logp_val);
+    print!("{:.6},{:.17e}", us_per_eval, logp_val);
+    for g in &gradient {
+        print!(",{:.17e}", g);
+    }
+    println!();
 }
 """
     (src_dir / "bench.rs").write_text(bench_rs)

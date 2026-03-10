@@ -1,14 +1,14 @@
-use pymc_compiled_model::generated::GeneratedLogp;
+use pymc_compiled_model::GeneratedLogp;
 use nuts_rs::CpuLogpFunc;
-use std::io::{self, BufRead};
 use std::time::Instant;
+use std::io::{self, BufRead};
 
 fn main() {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
 
     // First line: number of iterations
-    let n_iters: usize = lines.next().unwrap().unwrap().trim().parse().unwrap();
+    let n_iters: u64 = lines.next().unwrap().unwrap().trim().parse().unwrap();
 
     // Second line: parameter vector
     let param_line = lines.next().unwrap().unwrap();
@@ -16,7 +16,7 @@ fn main() {
         .map(|s| s.trim().parse().unwrap())
         .collect();
 
-    let mut logp_fn = GeneratedLogp;
+    let mut logp_fn = GeneratedLogp::default();
     let n = logp_fn.dim();
     let mut gradient = vec![0.0f64; n];
     let mut logp_val = 0.0f64;
@@ -35,6 +35,9 @@ fn main() {
 
     let nanos = elapsed.as_nanos() as f64;
     let us_per_eval = nanos / (n_iters as f64) / 1000.0;
-    let grad_str: Vec<String> = gradient.iter().map(|g| format!("{:.17e}", g)).collect();
-    println!("{:.6},{:.17e},{}", us_per_eval, logp_val, grad_str.join(","));
+    print!("{:.6},{:.17e}", us_per_eval, logp_val);
+    for g in &gradient {
+        print!(",{:.17e}", g);
+    }
+    println!();
 }

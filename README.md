@@ -13,19 +13,19 @@ PyMC Model → Extract logp graph + validation points → Claude API → Rust co
 3. **Verify**: Build and validate logp + gradients against PyMC's reference values
 4. **Iterate**: If validation fails, the agent reads errors, inspects data, and fixes code autonomously
 
-The agent has four tools: `write_rust_code`, `cargo_build`, `validate_logp`, and `read_file`. It loops until the model compiles and validates correctly (up to 5 attempts).
+The agent has four tools: `write_rust_code`, `cargo_build`, `validate_logp`, and `read_file`. It loops until the model compiles and validates correctly. Model-specific "skills" (GP, ZeroSumNormal) are detected automatically and loaded to provide specialized knowledge (e.g., faer Cholesky patterns, ZeroSum transform formulas).
 
 ## Benchmarks
 
 ### Compilation (Claude Sonnet 4)
 
-| Model | Params | Builds | Tokens | Result |
+| Model | Params | Tool Calls | Tokens | Result |
 |---|---|---|---|---|
-| Normal | 2 | 1 | 39K | First try |
-| Linear Regression | 3 | 1 | 52K | First try |
-| Hierarchical | 12 | 4 | 288K | Fixed gradients in 3 retries |
-| ZeroSumNormal | 124 | 1 | 213K | First try |
-| GP (ExpQuad) | 3 | 10 | 1.6M | Failed — Cholesky gradients |
+| Normal | 2 | 4 | 40K | First try |
+| Linear Regression | 3 | 4 | 54K | First try |
+| Hierarchical | 12 | 8 | 153K | Fixed gradients in 1 retry |
+| GP (ExpQuad) | 3 | 11 | 467K | Passed (GP skill) |
+| ZeroSumNormal | 142 | 9 | 484K | Passed (ZeroSumNormal skill) |
 
 ### Runtime: logp+dlogp evaluation speed
 
@@ -33,12 +33,12 @@ Rust vs nutpie's Numba backend (500K evaluations, lower is better):
 
 | Model | Numba (us/eval) | Rust (us/eval) | Speedup |
 |---|---|---|---|
-| Normal (2 params) | 0.99 | 0.15 | **6.6x** |
-| LinReg (3 params) | 1.62 | 0.37 | **4.3x** |
-| Hierarchical (12 params) | 2.82 | 0.62 | **4.6x** |
-| GP regression (3 params) | 126.70 | 52.84 | **2.4x** |
+| Normal (2 params) | 0.96 | 0.14 | **6.8x** |
+| LinReg (3 params) | 1.60 | 0.33 | **4.9x** |
+| Hierarchical (12 params) | 2.63 | 0.76 | **3.5x** |
+| GP regression (3 params) | 116.57 | 35.31 | **3.3x** |
 
-Numba column = `numba.cfunc` called from Rust in a tight loop (how nutpie actually works). The AI-compiled Rust is 2-7x faster across all models.
+Numba column = `numba.cfunc` called from Rust in a tight loop (how nutpie actually works). The AI-compiled Rust is 3-7x faster across all models.
 
 ## Quick start
 

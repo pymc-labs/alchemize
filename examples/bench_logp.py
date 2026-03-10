@@ -73,7 +73,7 @@ def make_gp_model():
     """GP regression, 3 unconstrained parameters (log_ls, log_eta, log_sigma)."""
     build_dir = Path("compiled_models/gp")
     y_obs = np.load(build_dir / "y_data.npy")
-    x = np.load(build_dir / "x_0_data.npy")
+    x = np.load(build_dir / "x_1_data.npy").ravel()
     with pm.Model() as model:
         ls = pm.HalfNormal("ls", sigma=5)
         eta = pm.HalfNormal("eta", sigma=5)

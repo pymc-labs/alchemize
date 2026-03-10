@@ -4,7 +4,7 @@ use nuts_rs::CpuLogpFunc;
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    let mut logp_fn = GeneratedLogp::new();
+    let mut logp_fn = GeneratedLogp::default();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();

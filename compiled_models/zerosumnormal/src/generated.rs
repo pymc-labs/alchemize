@@ -15,6 +15,7 @@ impl LogpError for SampleError {
 }
 
 pub const N_PARAMS: usize = 124;
+const LN_2PI: f64 = 1.8378770664093453;
 
 #[derive(Storable, Clone)]
 pub struct Draw {
@@ -23,7 +24,24 @@ pub struct Draw {
 }
 
 #[derive(Clone)]
-pub struct GeneratedLogp;
+pub struct GeneratedLogp {
+    // Pre-allocate arrays for ZeroSumTransform operations
+    store_effect_full: [f64; 6],
+    day_effect_full: [f64; 7], 
+    interaction_temp: Vec<f64>,  // 6*7*3 = 126 elements
+    interaction_full: Vec<f64>,  // 6*7*4 = 168 elements
+}
+
+impl Default for GeneratedLogp {
+    fn default() -> Self {
+        Self {
+            store_effect_full: [0.0; 6],
+            day_effect_full: [0.0; 7],
+            interaction_temp: vec![0.0; 6 * 7 * 3], // 126
+            interaction_full: vec![0.0; 6 * 7 * 4], // 168
+        }
+    }
+}
 
 impl HasDims for GeneratedLogp {
     fn dim_sizes(&self) -> HashMap<String, u64> {
@@ -39,279 +57,287 @@ impl CpuLogpFunc for GeneratedLogp {
     fn dim(&self) -> usize { N_PARAMS }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, SampleError> {
-        // Initialize gradient to zero
-        for g in gradient.iter_mut() {
-            *g = 0.0;
-        }
-
-        let mut total_logp = 0.0;
+        // Zero gradient
+        gradient.fill(0.0);
         
-        // Extract unconstrained parameters
+        let mut logp = 0.0f64;
+        
+        // Extract parameters from position
         let grand_mean = position[0];
-        let sigma_store_log = position[1];
-        let sigma_day_log = position[2]; 
-        let sigma_cat_log = position[3];
-        let store_effect_unc = &position[4..9];  // 5 elements
+        let log_sigma_store = position[1];
+        let log_sigma_day = position[2]; 
+        let log_sigma_cat = position[3];
+        let store_effect_unc = &position[4..9];   // 5 elements
         let day_effect_unc = &position[9..15];   // 6 elements
         let interaction_unc = &position[15..123]; // 108 elements (6*6*3)
-        let sigma_y_log = position[123];
+        let log_sigma_y = position[123];
 
-        // Transform to constrained space
-        let sigma_store = sigma_store_log.exp();
-        let sigma_day = sigma_day_log.exp();
-        let sigma_cat = sigma_cat_log.exp();
-        let sigma_y = sigma_y_log.exp();
+        // Transform log parameters to constrained space
+        let sigma_store = log_sigma_store.exp();
+        let sigma_day = log_sigma_day.exp(); 
+        let sigma_cat = log_sigma_cat.exp();
+        let sigma_y = log_sigma_y.exp();
 
-        // ============= grand_mean: Normal(0, 10) =============
-        let diff = grand_mean - 0.0;
-        let sigma_gm = 10.0_f64;
-        let term = diff / sigma_gm;
-        let gm_logp = -0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_gm.ln() - 0.5 * term * term;
-        total_logp += gm_logp;
-        gradient[0] += -diff / (sigma_gm * sigma_gm);
-
-        // ============= sigma_store: HalfNormal(2) with LogTransform =============
-        let x = sigma_store;
-        let sigma_hn = 2.0_f64;
-        let hn_logp = (2.0_f64).ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_hn.ln() - 0.5 * (x / sigma_hn).powi(2);
-        let jacobian = sigma_store_log; // log jacobian for exp transform
-        let store_logp = hn_logp + jacobian;
-        total_logp += store_logp;
+        // === PRIOR TERMS ===
         
-        // For HalfNormal(x|sigma) with LogTransform: gradient = (-x²/sigma² + 1) * x  
-        gradient[1] += (-x * x / (sigma_hn * sigma_hn) + 1.0) * sigma_store;
+        // grand_mean ~ Normal(0, 10)
+        let grand_mean_term = -0.5 * LN_2PI - (10.0f64).ln() - 0.5 * (grand_mean / 10.0).powi(2);
+        logp += grand_mean_term;
+        gradient[0] += -grand_mean / 100.0; // d/d(grand_mean)
 
-        // ============= sigma_day: HalfNormal(2) with LogTransform =============
-        let x = sigma_day;
-        let hn_logp = (2.0_f64).ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_hn.ln() - 0.5 * (x / sigma_hn).powi(2);
-        let jacobian = sigma_day_log;
-        let day_logp = hn_logp + jacobian;
-        total_logp += day_logp;
+        // sigma_store ~ HalfNormal(2) with LogTransform
+        if sigma_store > 0.0 {
+            let hn_term = (2.0f64).ln() - 0.5 * LN_2PI - (2.0f64).ln() - 0.5 * (sigma_store / 2.0).powi(2) + log_sigma_store;
+            logp += hn_term;
+            gradient[1] += -sigma_store * sigma_store / 4.0 + 1.0; // d/d(log_sigma_store)
+        } else {
+            return Ok(f64::NEG_INFINITY);
+        }
+
+        // sigma_day ~ HalfNormal(2) with LogTransform  
+        if sigma_day > 0.0 {
+            let hn_term = (2.0f64).ln() - 0.5 * LN_2PI - (2.0f64).ln() - 0.5 * (sigma_day / 2.0).powi(2) + log_sigma_day;
+            logp += hn_term;
+            gradient[2] += -sigma_day * sigma_day / 4.0 + 1.0; // d/d(log_sigma_day)
+        } else {
+            return Ok(f64::NEG_INFINITY);
+        }
+
+        // sigma_cat ~ HalfNormal(2) with LogTransform
+        if sigma_cat > 0.0 {
+            let hn_term = (2.0f64).ln() - 0.5 * LN_2PI - (2.0f64).ln() - 0.5 * (sigma_cat / 2.0).powi(2) + log_sigma_cat;
+            logp += hn_term;
+            gradient[3] += -sigma_cat * sigma_cat / 4.0 + 1.0; // d/d(log_sigma_cat)
+        } else {
+            return Ok(f64::NEG_INFINITY);
+        }
+
+        // sigma_y ~ HalfNormal(5) with LogTransform
+        if sigma_y > 0.0 {
+            let hn_term = (2.0f64).ln() - 0.5 * LN_2PI - (5.0f64).ln() - 0.5 * (sigma_y / 5.0).powi(2) + log_sigma_y;
+            logp += hn_term;
+            gradient[123] += -sigma_y * sigma_y / 25.0 + 1.0; // d/d(log_sigma_y)
+        } else {
+            return Ok(f64::NEG_INFINITY);
+        }
+
+        // store_effect ~ ZeroSumNormal(sigma_store, shape=[6])
+        // Uses 5 unconstrained parameters, logp evaluated on unconstrained values only
+        let n_store_unc = 5.0_f64;
+        let inv_sigma_store_sq = 1.0 / (sigma_store * sigma_store);
+        let log_term_store = n_store_unc * (-0.5 * LN_2PI - log_sigma_store);
+        logp += log_term_store;
         
-        gradient[2] += (-x * x / (sigma_hn * sigma_hn) + 1.0) * sigma_day;
-
-        // ============= sigma_cat: HalfNormal(2) with LogTransform =============
-        let x = sigma_cat;
-        let hn_logp = (2.0_f64).ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_hn.ln() - 0.5 * (x / sigma_hn).powi(2);
-        let jacobian = sigma_cat_log;
-        let cat_logp = hn_logp + jacobian;
-        total_logp += cat_logp;
-        
-        gradient[3] += (-x * x / (sigma_hn * sigma_hn) + 1.0) * sigma_cat;
-
-        // ============= store_effect: ZeroSumNormal(sigma_store, shape=6) =============
-        // ZeroSumNormal logp uses only the 5 unconstrained elements
-        let n_unc_store = 5;
         let mut sum_sq_store = 0.0;
-        for &x in store_effect_unc {
-            sum_sq_store += x * x;
-        }
-        let store_eff_logp = (n_unc_store as f64) * (-0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_store.ln()) - 0.5 * sum_sq_store / (sigma_store * sigma_store);
-        total_logp += store_eff_logp;
-        
-        // Gradient w.r.t unconstrained elements
-        for (i, &x) in store_effect_unc.iter().enumerate() {
-            gradient[4 + i] += -x / (sigma_store * sigma_store);
-        }
-        // Gradient w.r.t log(sigma_store) from ZeroSumNormal - exactly as computed
-        gradient[1] += (-n_unc_store as f64 + sum_sq_store / (sigma_store * sigma_store)) * sigma_store;
-
-        // ============= day_effect: ZeroSumNormal(sigma_day, shape=7) =============
-        let n_unc_day = 6;
-        let mut sum_sq_day = 0.0;
-        for &x in day_effect_unc {
-            sum_sq_day += x * x;
-        }
-        let day_eff_logp = (n_unc_day as f64) * (-0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_day.ln()) - 0.5 * sum_sq_day / (sigma_day * sigma_day);
-        total_logp += day_eff_logp;
-        
-        // Gradient w.r.t unconstrained elements
-        for (i, &x) in day_effect_unc.iter().enumerate() {
-            gradient[9 + i] += -x / (sigma_day * sigma_day);
-        }
-        // Gradient w.r.t log(sigma_day) from ZeroSumNormal - exactly as computed
-        gradient[2] += (-n_unc_day as f64 + sum_sq_day / (sigma_day * sigma_day)) * sigma_day;
-
-        // ============= interaction: ZeroSumNormal(sigma_cat, shape=(6,7,4), n_zerosum_axes=2) =============
-        let n_unc_int = 108; // 6*6*3
-        let mut sum_sq_int = 0.0;
-        for &x in interaction_unc {
-            sum_sq_int += x * x;
-        }
-        let int_logp = (n_unc_int as f64) * (-0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_cat.ln()) - 0.5 * sum_sq_int / (sigma_cat * sigma_cat);
-        total_logp += int_logp;
-        
-        // Gradient w.r.t unconstrained elements
-        for (i, &x) in interaction_unc.iter().enumerate() {
-            gradient[15 + i] += -x / (sigma_cat * sigma_cat);
-        }
-        // Gradient w.r.t log(sigma_cat) from ZeroSumNormal - exactly as computed
-        gradient[3] += (-n_unc_int as f64 + sum_sq_int / (sigma_cat * sigma_cat)) * sigma_cat;
-
-        // ============= sigma_y: HalfNormal(5) with LogTransform =============
-        let x = sigma_y;
-        let sigma_hn = 5.0_f64;
-        let hn_logp = (2.0_f64).ln() - 0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_hn.ln() - 0.5 * (x / sigma_hn).powi(2);
-        let jacobian = sigma_y_log;
-        let y_sigma_logp = hn_logp + jacobian;
-        total_logp += y_sigma_logp;
-        
-        gradient[123] += (-x * x / (sigma_hn * sigma_hn) + 1.0) * sigma_y;
-
-        // ============= Transform unconstrained effects to constrained for likelihood =============
-        
-        // Transform store_effect (5 -> 6)
-        let mut store_effect_full = vec![0.0; 6];
-        let n = 6.0_f64;
-        let sum_x: f64 = store_effect_unc.iter().sum();
-        let norm = sum_x / (n.sqrt() + n);
-        let fill = norm - sum_x / n.sqrt();
         for i in 0..5 {
-            store_effect_full[i] = store_effect_unc[i] - norm;
+            sum_sq_store += store_effect_unc[i] * store_effect_unc[i];
+            gradient[4 + i] += -store_effect_unc[i] * inv_sigma_store_sq;
         }
-        store_effect_full[5] = fill - norm;
+        logp += -0.5 * sum_sq_store * inv_sigma_store_sq;
+        gradient[1] += (-n_store_unc + sum_sq_store / (sigma_store * sigma_store));
 
-        // Transform day_effect (6 -> 7)
-        let mut day_effect_full = vec![0.0; 7];
-        let n = 7.0_f64;
-        let sum_x: f64 = day_effect_unc.iter().sum();
-        let norm = sum_x / (n.sqrt() + n);
-        let fill = norm - sum_x / n.sqrt();
+        // day_effect ~ ZeroSumNormal(sigma_day, shape=[7])
+        // Uses 6 unconstrained parameters
+        let n_day_unc = 6.0_f64;
+        let inv_sigma_day_sq = 1.0 / (sigma_day * sigma_day);
+        let log_term_day = n_day_unc * (-0.5 * LN_2PI - log_sigma_day);
+        logp += log_term_day;
+        
+        let mut sum_sq_day = 0.0;
         for i in 0..6 {
-            day_effect_full[i] = day_effect_unc[i] - norm;
+            sum_sq_day += day_effect_unc[i] * day_effect_unc[i];
+            gradient[9 + i] += -day_effect_unc[i] * inv_sigma_day_sq;
         }
-        day_effect_full[6] = fill - norm;
+        logp += -0.5 * sum_sq_day * inv_sigma_day_sq;
+        gradient[2] += (-n_day_unc + sum_sq_day / (sigma_day * sigma_day));
+
+        // interaction ~ ZeroSumNormal(sigma_cat, shape=[6,7,4]) with zerosum_axes=[-2,-1]
+        // Unconstrained shape: [6,6,3] = 108 elements
+        let n_interaction_unc = 108.0_f64;
+        let inv_sigma_cat_sq = 1.0 / (sigma_cat * sigma_cat);
+        let log_term_interaction = n_interaction_unc * (-0.5 * LN_2PI - log_sigma_cat);
+        logp += log_term_interaction;
+        
+        let mut sum_sq_interaction = 0.0;
+        for i in 0..108 {
+            sum_sq_interaction += interaction_unc[i] * interaction_unc[i];
+            gradient[15 + i] += -interaction_unc[i] * inv_sigma_cat_sq;
+        }
+        logp += -0.5 * sum_sq_interaction * inv_sigma_cat_sq;
+        gradient[3] += (-n_interaction_unc + sum_sq_interaction / (sigma_cat * sigma_cat));
+
+        // === FORWARD TRANSFORMS FOR LIKELIHOOD ===
+        
+        // Transform store_effect: 5 -> 6 elements
+        let sum_x_store: f64 = store_effect_unc.iter().sum();
+        let n_store = 6.0_f64;
+        let norm_store = sum_x_store / (n_store.sqrt() + n_store);
+        let fill_store = norm_store - sum_x_store / n_store.sqrt();
+        
+        for i in 0..5 {
+            self.store_effect_full[i] = store_effect_unc[i] - norm_store;
+        }
+        self.store_effect_full[5] = fill_store - norm_store;
+
+        // Transform day_effect: 6 -> 7 elements
+        let sum_x_day: f64 = day_effect_unc.iter().sum();
+        let n_day = 7.0_f64;
+        let norm_day = sum_x_day / (n_day.sqrt() + n_day);
+        let fill_day = norm_day - sum_x_day / n_day.sqrt();
+        
+        for i in 0..6 {
+            self.day_effect_full[i] = day_effect_unc[i] - norm_day;
+        }
+        self.day_effect_full[6] = fill_day - norm_day;
 
         // Transform interaction: (6,6,3) -> (6,7,3) -> (6,7,4)
-        // Step 1: extend axis -2 (middle axis): (6,6,3) -> (6,7,3)
-        let mut interaction_temp = vec![vec![vec![0.0; 3]; 7]; 6];
+        // First extend axis -2: 6->7 along dim 1
         for i in 0..6 {
-            let n = 7.0_f64;
-            // Sum over middle axis
-            let mut sums = vec![0.0; 3];
             for k in 0..3 {
+                let mut sum_j = 0.0;
                 for j in 0..6 {
-                    let idx = i * 6 * 3 + j * 3 + k;
-                    sums[k] += interaction_unc[idx];
+                    sum_j += interaction_unc[i * 6 * 3 + j * 3 + k];
                 }
-            }
-            
-            for k in 0..3 {
-                let sum_x = sums[k];
-                let norm = sum_x / (n.sqrt() + n);
-                let fill = norm - sum_x / n.sqrt();
+                let n_j = 7.0_f64;
+                let norm_j = sum_j / (n_j.sqrt() + n_j);
+                let fill_j = norm_j - sum_j / n_j.sqrt();
                 
-                // Copy original elements
                 for j in 0..6 {
-                    let idx = i * 6 * 3 + j * 3 + k;
-                    interaction_temp[i][j][k] = interaction_unc[idx] - norm;
+                    self.interaction_temp[i * 7 * 3 + j * 3 + k] = 
+                        interaction_unc[i * 6 * 3 + j * 3 + k] - norm_j;
                 }
-                // Fill element
-                interaction_temp[i][6][k] = fill - norm;
+                self.interaction_temp[i * 7 * 3 + 6 * 3 + k] = fill_j - norm_j;
             }
         }
-
-        // Step 2: extend axis -1 (last axis): (6,7,3) -> (6,7,4)
-        let mut interaction_full = vec![vec![vec![0.0; 4]; 7]; 6];
-        for i in 0..6 {
-            for j in 0..7 {
-                let n = 4.0_f64;
-                let sum_x: f64 = interaction_temp[i][j].iter().sum();
-                let norm = sum_x / (n.sqrt() + n);
-                let fill = norm - sum_x / n.sqrt();
-                
-                for k in 0..3 {
-                    interaction_full[i][j][k] = interaction_temp[i][j][k] - norm;
-                }
-                interaction_full[i][j][3] = fill - norm;
-            }
-        }
-
-        // ============= y likelihood: Normal(mu, sigma_y) =============
-        let mut y_logp = 0.0;
-        let mut grad_grand_mean = 0.0;
-        let mut grad_sigma_y_log = 0.0;
-        let mut grad_store_effect = vec![0.0; 6];
-        let mut grad_day_effect = vec![0.0; 7]; 
-        let mut grad_interaction = vec![vec![vec![0.0; 4]; 7]; 6];
-
-        for obs in 0..Y_N {
-            let y_obs = Y_DATA[obs];
-            // Based on data description:
-            // X_0_DATA → cat_idx (values 0..3, 4 groups)  
-            // X_1_DATA → day_idx (values 0..6, 7 groups)
-            // X_2_DATA → store_idx (values 0..5, 6 groups)
-            let cat_idx = X_0_DATA[obs] as usize;
-            let day_idx = X_1_DATA[obs] as usize;   
-            let store_idx = X_2_DATA[obs] as usize; 
-            
-            let mu = grand_mean + store_effect_full[store_idx] + day_effect_full[day_idx] + interaction_full[store_idx][day_idx][cat_idx];
-            let residual = y_obs - mu;
-            let term = residual / sigma_y;
-            
-            let obs_logp = -0.5 * (2.0 * std::f64::consts::PI).ln() - sigma_y.ln() - 0.5 * term * term;
-            y_logp += obs_logp;
-
-            // Gradients for observed likelihood
-            let grad_mu = residual / (sigma_y * sigma_y);
-            grad_grand_mean += grad_mu;
-            grad_store_effect[store_idx] += grad_mu;
-            grad_day_effect[day_idx] += grad_mu;
-            grad_interaction[store_idx][day_idx][cat_idx] += grad_mu;
-            
-            grad_sigma_y_log += (-1.0 / sigma_y + residual * residual / (sigma_y * sigma_y * sigma_y)) * sigma_y;
-        }
-
-        total_logp += y_logp;
-        gradient[0] += grad_grand_mean;
-        gradient[123] += grad_sigma_y_log;
-
-        // ============= Backpropagate gradients through ZeroSum transforms =============
         
-        // Store effect gradient
-        let n = 6.0_f64;
-        let sum_grad: f64 = grad_store_effect[0..5].iter().sum();
-        let grad_fill = grad_store_effect[5];
-        for j in 0..5 {
-            gradient[4 + j] += grad_store_effect[j] - sum_grad / (n.sqrt() + n) - grad_fill / n.sqrt();
-        }
-
-        // Day effect gradient  
-        let n = 7.0_f64;
-        let sum_grad: f64 = grad_day_effect[0..6].iter().sum();
-        let grad_fill = grad_day_effect[6];
-        for j in 0..6 {
-            gradient[9 + j] += grad_day_effect[j] - sum_grad / (n.sqrt() + n) - grad_fill / n.sqrt();
-        }
-
-        // Interaction gradient - reverse order of transforms
-        // First: backprop through axis -1 transform: (6,7,4) -> (6,7,3)
-        let mut grad_interaction_temp = vec![vec![vec![0.0; 3]; 7]; 6];
+        // Then extend axis -1: 3->4 along dim 2
         for i in 0..6 {
             for j in 0..7 {
-                let n = 4.0_f64;
-                let sum_grad: f64 = grad_interaction[i][j][0..3].iter().sum();
-                let grad_fill = grad_interaction[i][j][3];
+                let mut sum_k = 0.0;
                 for k in 0..3 {
-                    grad_interaction_temp[i][j][k] = grad_interaction[i][j][k] - sum_grad / (n.sqrt() + n) - grad_fill / n.sqrt();
+                    sum_k += self.interaction_temp[i * 7 * 3 + j * 3 + k];
                 }
+                let n_k = 4.0_f64;
+                let norm_k = sum_k / (n_k.sqrt() + n_k);
+                let fill_k = norm_k - sum_k / n_k.sqrt();
+                
+                for k in 0..3 {
+                    self.interaction_full[i * 7 * 4 + j * 4 + k] = 
+                        self.interaction_temp[i * 7 * 3 + j * 3 + k] - norm_k;
+                }
+                self.interaction_full[i * 7 * 4 + j * 4 + 3] = fill_k - norm_k;
             }
         }
 
-        // Second: backprop through axis -2 transform: (6,7,3) -> (6,6,3)
+        // === OBSERVED LIKELIHOOD ===
+        // y ~ Normal(mu, sigma_y) where mu = grand_mean + store_effect + day_effect + interaction
+        
+        let inv_sigma_y_sq = 1.0 / (sigma_y * sigma_y);
+        let neg_log_sigma_y = -log_sigma_y;
+        let log_norm_y = -0.5 * LN_2PI + neg_log_sigma_y;
+        
+        let mut grad_grand_mean = 0.0;
+        let mut grad_log_sigma_y = 0.0;
+        let mut grad_store_effect = [0.0; 6];
+        let mut grad_day_effect = [0.0; 7];
+        let mut grad_interaction = vec![0.0; 6 * 7 * 4];
+        
+        for i in 0..Y_N {
+            let store_idx = X_2_DATA[i] as usize;
+            let day_idx = X_1_DATA[i] as usize;
+            let cat_idx = X_0_DATA[i] as usize;
+            
+            let mu_i = grand_mean 
+                + self.store_effect_full[store_idx]
+                + self.day_effect_full[day_idx]
+                + self.interaction_full[store_idx * 7 * 4 + day_idx * 4 + cat_idx];
+                
+            let residual = Y_DATA[i] - mu_i;
+            logp += log_norm_y - 0.5 * residual * residual * inv_sigma_y_sq;
+            
+            // Gradients
+            let scaled_residual = residual * inv_sigma_y_sq;
+            grad_grand_mean += scaled_residual;
+            grad_store_effect[store_idx] += scaled_residual;
+            grad_day_effect[day_idx] += scaled_residual;
+            grad_interaction[store_idx * 7 * 4 + day_idx * 4 + cat_idx] += scaled_residual;
+            
+            grad_log_sigma_y += residual * residual / (sigma_y * sigma_y) - 1.0;
+        }
+        
+        // Apply gradients
+        gradient[0] += grad_grand_mean;
+        gradient[123] += grad_log_sigma_y;
+
+        // Backprop through ZeroSumTransforms
+        // store_effect: 6 -> 5
+        let n_store_f64 = 6.0_f64;
+        let mut sum_grad_store = 0.0;
+        for i in 0..5 {
+            sum_grad_store += grad_store_effect[i];
+        }
+        let grad_fill_store = grad_store_effect[5];
+        
+        for i in 0..5 {
+            gradient[4 + i] += grad_store_effect[i] 
+                - sum_grad_store / (n_store_f64.sqrt() + n_store_f64)
+                - grad_fill_store / n_store_f64.sqrt();
+        }
+
+        // day_effect: 7 -> 6  
+        let n_day_f64 = 7.0_f64;
+        let mut sum_grad_day = 0.0;
+        for i in 0..6 {
+            sum_grad_day += grad_day_effect[i];
+        }
+        let grad_fill_day = grad_day_effect[6];
+        
+        for i in 0..6 {
+            gradient[9 + i] += grad_day_effect[i]
+                - sum_grad_day / (n_day_f64.sqrt() + n_day_f64)
+                - grad_fill_day / n_day_f64.sqrt();
+        }
+
+        // interaction: (6,7,4) -> (6,7,3) -> (6,6,3)
+        // First backprop axis -1: 4->3
+        for i in 0..6 {
+            for j in 0..7 {
+                let n_k_f64 = 4.0_f64;
+                let mut sum_grad_k = 0.0;
+                for k in 0..3 {
+                    sum_grad_k += grad_interaction[i * 7 * 4 + j * 4 + k];
+                }
+                let grad_fill_k = grad_interaction[i * 7 * 4 + j * 4 + 3];
+                
+                for k in 0..3 {
+                    self.interaction_temp[i * 7 * 3 + j * 3 + k] = 
+                        grad_interaction[i * 7 * 4 + j * 4 + k]
+                        - sum_grad_k / (n_k_f64.sqrt() + n_k_f64)
+                        - grad_fill_k / n_k_f64.sqrt();
+                }
+            }
+        }
+        
+        // Then backprop axis -2: 7->6
         for i in 0..6 {
             for k in 0..3 {
-                let n = 7.0_f64;
-                let sum_grad: f64 = grad_interaction_temp[i][0..6].iter().map(|row| row[k]).sum();
-                let grad_fill = grad_interaction_temp[i][6][k];
+                let n_j_f64 = 7.0_f64;
+                let mut sum_grad_j = 0.0;
                 for j in 0..6 {
-                    let idx = i * 6 * 3 + j * 3 + k;
-                    gradient[15 + idx] += grad_interaction_temp[i][j][k] - sum_grad / (n.sqrt() + n) - grad_fill / n.sqrt();
+                    sum_grad_j += self.interaction_temp[i * 7 * 3 + j * 3 + k];
+                }
+                let grad_fill_j = self.interaction_temp[i * 7 * 3 + 6 * 3 + k];
+                
+                for j in 0..6 {
+                    gradient[15 + i * 6 * 3 + j * 3 + k] += 
+                        self.interaction_temp[i * 7 * 3 + j * 3 + k]
+                        - sum_grad_j / (n_j_f64.sqrt() + n_j_f64)
+                        - grad_fill_j / n_j_f64.sqrt();
                 }
             }
         }
 
-        Ok(total_logp)
+        Ok(logp)
     }
 
     fn expand_vector<R: rand::Rng + ?Sized>(
