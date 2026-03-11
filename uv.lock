@@ -2100,6 +2100,7 @@ dependencies = [
     { name = "numpy" },
     { name = "nutpie" },
     { name = "pymc" },
+    { name = "torch" },
 ]
 
 [package.optional-dependencies]
@@ -2143,6 +2144,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "torch", specifier = ">=2.10.0" },
     { name = "torch", marker = "extra == 'dl'", specifier = ">=2.0" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.0" },
 ]
