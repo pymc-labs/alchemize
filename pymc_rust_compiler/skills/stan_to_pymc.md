@@ -499,6 +499,112 @@ constructs:
 - Use `pm.ZeroInflatedPoisson`, `pm.Hurdle*`, etc. for mixture-type likelihoods
 - Only fall back to `pm.Potential` when there is no clean distribution equivalent
 
+## Coords and Dims: Named Dimensions for All Parameters
+
+**Always set up `coords` and `dims` when translating Stan models.** This is idiomatic PyMC
+and produces cleaner InferenceData with labeled axes instead of integer indices.
+
+### Why this matters
+
+- **Readable traces**: `idata.posterior["theta"].sel(group="A")` vs `idata.posterior["theta"][:, :, 0]`
+- **Self-documenting models**: dims make the shape semantics explicit
+- **Better plotting**: ArviZ automatically labels axes from coords
+- **Error catching**: shape mismatches are caught earlier with named dims
+
+### Setting up coords from Stan data
+
+Stan models declare array sizes in the `data` block (`int<lower=1> K`, `int<lower=1> N`,
+etc.). Map these to coords in the `pm.Model()` constructor:
+
+```stan
+data {
+  int<lower=1> N;        // number of observations
+  int<lower=1> K;        // number of predictors
+  int<lower=1> J;        // number of groups
+  array[N] int<lower=1,upper=J> group;
+  matrix[N, K] X;
+  vector[N] y;
+}
+parameters {
+  vector[K] beta;
+  vector[J] alpha;
+  real<lower=0> sigma;
+}
+```
+```python
+# Define coords from data dimensions
+coords = {
+    "predictor": [f"x{k}" for k in range(K)],  # or actual feature names if available
+    "group": group_names,                        # e.g. ["A", "B", "C", ...] or range(J)
+    "obs": np.arange(N),
+}
+
+with pm.Model(coords=coords) as model:
+    beta = pm.Normal("beta", mu=0, sigma=10, dims="predictor")
+    alpha = pm.Normal("alpha", mu=0, sigma=10, dims="group")
+    sigma = pm.HalfNormal("sigma", sigma=5)
+
+    mu = pm.math.dot(X_data, beta) + alpha[group_idx]
+    pm.Normal("y", mu=mu, sigma=sigma, observed=y_data, dims="obs")
+```
+
+### Multi-dimensional parameters
+
+For parameters with multiple dimensions, pass a tuple of dim names:
+
+```stan
+// Stan: matrix parameter
+matrix[J, K] beta;
+```
+```python
+# PyMC: use a tuple of dims
+beta = pm.Normal("beta", mu=0, sigma=10, dims=("group", "predictor"))
+```
+
+### Coords for hierarchical models
+
+```stan
+data {
+  int<lower=1> J;      // counties
+  int<lower=1> N;      // observations
+  array[N] int county;
+}
+parameters {
+  vector[J] alpha;
+}
+```
+```python
+coords = {
+    "county": county_names,  # use meaningful labels, not just range(J)
+    "obs": np.arange(N),
+}
+
+with pm.Model(coords=coords) as model:
+    alpha = pm.Normal("alpha", mu=mu_alpha, sigma=sigma_alpha, dims="county")
+    pm.Normal("y", mu=alpha[county_idx], sigma=sigma_y, observed=y_data, dims="obs")
+```
+
+### Mutable coords for varying-size data
+
+When a dimension might change size (e.g., for out-of-sample prediction), use
+`model.add_coord` with `mutable=True`:
+
+```python
+with pm.Model() as model:
+    model.add_coord("obs", np.arange(N_train), mutable=True)
+    # ...
+    # Later, for prediction:
+    pm.set_data({"X": X_test}, coords={"obs": np.arange(N_test)})
+```
+
+### When to use `shape` vs `dims`
+
+- **Prefer `dims`** for any parameter or observed variable with a meaningful semantic axis
+  (groups, predictors, time steps, categories, etc.)
+- **Fall back to `shape`** only for internal helper variables where naming adds no clarity
+- **Use `dims` on `pm.Deterministic` too** — transformed parameters benefit from labeled
+  axes just as much as priors do
+
 ## Important Conventions
 
 1. **Indexing**: Stan is 1-based, Python/PyMC is 0-based. Adjust all index arrays.
@@ -511,8 +617,8 @@ constructs:
    `pm.Flat()` or (better) specify an explicit prior.
 5. **Observed data**: Pass as `observed=` kwarg to the likelihood distribution. Data should
    be numpy arrays.
-6. **Coords and dims**: PyMC supports named dimensions. Use `coords=` in `pm.Model()` and
-   `dims=` in distributions for better InferenceData output.
+6. **Coords and dims**: **Always** set up coords and dims. See the "Coords and Dims" section
+   above for full guidance. This produces labeled InferenceData and self-documenting models.
 7. **PyTensor**: PyMC uses PyTensor (formerly Aesara/Theano) for symbolic math. Import as
    `import pytensor.tensor as pt` for operations not directly in `pm.math`.
 8. **Transformed parameters**: Use `pm.Deterministic(...)` or plain pytensor expressions.
