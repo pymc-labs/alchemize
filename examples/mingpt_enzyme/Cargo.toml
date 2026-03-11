@@ -1,0 +1,15 @@
+[package]
+name = "mingpt-enzyme"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+lto = "fat"
+
+[[bin]]
+name = "test_grad"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench_grad"
+path = "src/bench_grad.rs"

@@ -11,6 +11,7 @@ dependencies = [
     "numpy",
     "marimo>=0.20.4",
     "bridgestan>=2.7.0",
+    "torch>=2.10.0",
 ]
 
 [project.optional-dependencies]
