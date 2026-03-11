@@ -51,7 +51,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-burn = { version = "0.16", features = ["ndarray", "autodiff"] }
+burn = { version = "0.20", features = ["ndarray", "autodiff"] }
 
 [[bin]]
 name = "validate"
