@@ -1,6 +1,6 @@
 # Bayes AI Compiler
 
-An AI agent that acts as a compiler for Bayesian models. It transpiles between probabilistic programming languages (PyMC, Stan) and compiles to optimized Rust, with numerical validation at every step.
+An AI agent that acts as a compiler for computational models. It transpiles between probabilistic programming languages (PyMC, Stan), deep learning frameworks (JAX, PyTorch), and compiles to optimized Rust — with numerical validation at every step.
 
 **[Read the blog post →](https://twiecki.io/blog/2026/03/10/pymc-rust-ai-compiler/)**
 
@@ -9,7 +9,7 @@ An AI agent that acts as a compiler for Bayesian models. It transpiles between p
 The agent doesn't translate ops mechanically. It reasons about the full computational graph and applies the optimizations a domain expert would: loop fusion, memory pre-allocation, cache-friendly access patterns.
 
 ```
-Source (PyMC/Stan) → Extract logp + validation points → Claude agent loop → Target (Rust/PyMC) → Verify
+Source (PyMC/Stan/JAX/PyTorch) → Extract outputs + validation points → Claude agent loop → Target (Rust/PyMC/PyTorch/JAX) → Verify
 ```
 
 1. **Extract**: Read model to get parameters, transforms, logp graph, and reference values
@@ -25,6 +25,9 @@ The agent has four tools: `write_rust_code`, `cargo_build`, `validate_logp`, and
 - **ZeroSumNormal**: ZeroSum transform formulas and constraint handling
 - **Stan → Rust**: Stan model extraction via BridgeStan
 - **Stan → PyMC**: Distribution mappings, idiom translation, constraint handling
+- **JAX → PyTorch**: Functional-to-stateful translation, op mapping, weight transposition
+- **PyTorch → JAX**: Stateful-to-functional translation, pure function extraction
+- **PyTorch → Rust**: Neural net to zero-dependency Rust binary, forward + gradient validation
 
 Hardware is auto-detected: CUDA → Accelerate (Apple Silicon) → CPU fallback.
 
@@ -103,6 +106,13 @@ python examples/bench_logp.py
 # Stan → PyMC transpilation
 python examples/stan_pymc_01_normal.py
 python examples/stan_pymc_02_hierarchical.py
+
+# JAX ↔ PyTorch transpilation
+python examples/jax_to_pytorch_mlp.py
+python examples/pytorch_to_jax_mlp.py
+
+# PyTorch → Rust (zero-dependency inference binary)
+python examples/pytorch_to_rust_mlp.py
 ```
 
 ## Architecture
@@ -113,16 +123,23 @@ pymc_rust_compiler/
 ├── compiler.py       # Agentic loop: Claude API → Rust code → build → validate
 ├── stan_exporter.py  # Extract Stan model context via BridgeStan
 ├── stan_compiler.py  # Stan → Rust agentic compiler
-├── stan_to_pymc.py   # Stan → PyMC agentic transpiler
-├── nutpie_bridge.py  # nutpie integration: compiled Rust → nutpie.sample()
-├── benchmark.py      # logp eval benchmarks: Rust vs Numba (jit + cfunc)
-└── skills/           # Model-specific knowledge for the AI agent
+├── stan_to_pymc.py           # Stan → PyMC agentic transpiler
+├── jax_exporter.py           # Extract model info from JAX functions
+├── pytorch_exporter.py       # Extract model info from PyTorch modules
+├── jax_pytorch_transpiler.py  # JAX ↔ PyTorch agentic transpiler
+├── pytorch_rust_transpiler.py # PyTorch → Rust agentic transpiler (zero-dep inference)
+├── nutpie_bridge.py          # nutpie integration: compiled Rust → nutpie.sample()
+├── benchmark.py              # logp eval benchmarks: Rust vs Numba (jit + cfunc)
+└── skills/                   # Model-specific knowledge for the AI agent
     ├── gp.md              # CPU GP (faer Cholesky)
     ├── gp_accelerate.md   # Apple Silicon GP (Accelerate LAPACK / AMX)
     ├── gp_cuda.md         # NVIDIA GPU GP (cudarc + cuSOLVER)
     ├── zerosumnormal.md
     ├── stan.md            # Stan → Rust translation knowledge
-    └── stan_to_pymc.md    # Stan → PyMC translation knowledge
+    ├── stan_to_pymc.md    # Stan → PyMC translation knowledge
+    ├── jax_to_pytorch.md  # JAX → PyTorch op mapping + idioms
+    ├── pytorch_to_jax.md  # PyTorch → JAX op mapping + idioms
+    └── pytorch_to_rust.md # PyTorch → Rust: matmul, activations, backprop
 
 rust_template/      # Template Rust project (Cargo.toml, data loading, validation)
 bench_runner/       # Rust lib for calling Numba cfunc from Rust (like nutpie)
@@ -146,4 +163,72 @@ result = transpile_stan_to_pymc(stan_code, data={"N": 100, "y": [...]})
 if result.success:
     model = result.get_model(data)  # returns a pm.Model
     print(result.pymc_code)         # generated Python code
+```
+
+## JAX ↔ PyTorch Transpiler
+
+The same agentic architecture generalizes to deep learning frameworks. Claude translates between JAX's functional style and PyTorch's stateful modules, validating forward pass outputs and gradients at multiple test points.
+
+### JAX → PyTorch
+
+```python
+import jax.numpy as jnp
+from pymc_rust_compiler import transpile_jax_to_pytorch
+
+def forward(params, x):
+    x = jax.nn.relu(x @ params["w1"] + params["b1"])
+    return x @ params["w2"] + params["b2"]
+
+params = {"w1": jnp.ones((4, 8)), "b1": jnp.zeros(8),
+          "w2": jnp.ones((8, 2)), "b2": jnp.zeros(2)}
+
+result = transpile_jax_to_pytorch(forward, params, sample_input=jnp.ones((1, 4)))
+if result.success:
+    model = result.get_model(params)  # returns a torch.nn.Module
+```
+
+### PyTorch → JAX
+
+```python
+import torch.nn as nn
+from pymc_rust_compiler import transpile_pytorch_to_jax
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 8)
+        self.fc2 = nn.Linear(8, 2)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+result = transpile_pytorch_to_jax(MLP(), sample_input=torch.randn(1, 4))
+if result.success:
+    jax_params, forward_fn = result.get_model(param_data)
+    output = forward_fn(jax_params, jnp.ones((1, 4)))
+```
+
+## PyTorch → Rust Transpiler
+
+The killer feature for inference deployment. Takes a PyTorch `nn.Module` and generates a **zero-dependency Rust binary** — no ML framework, no Python runtime, just raw f32 math compiled to native code. Parameters are baked in as `const` arrays.
+
+The agent uses the same agentic architecture with tools: `write_code` → `cargo_build` → `validate_model` (forward pass + gradient matching). The generated Rust code includes both `forward()` and manual backpropagation for gradient validation.
+
+```python
+import torch.nn as nn
+from pymc_rust_compiler import transpile_pytorch_to_rust
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(4, 8)
+        self.fc2 = nn.Linear(8, 2)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+result = transpile_pytorch_to_rust(MLP(), sample_input=torch.randn(1, 4))
+if result.success:
+    print(f"Binary at: {result.binary_path}")  # Zero-dependency native binary
+    result.save("model.rs")                     # Save the generated Rust code
 ```
