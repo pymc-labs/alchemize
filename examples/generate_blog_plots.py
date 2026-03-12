@@ -75,6 +75,21 @@ def make_hierarchical_model():
     return model
 
 
+def make_gp_model():
+    build_dir = Path("compiled_models/gp")
+    y_obs = np.load(build_dir / "y_data.npy")
+    x = np.load(build_dir / "x_1_data.npy")
+    with pm.Model() as model:
+        ls = pm.HalfNormal("ls", sigma=5)
+        eta = pm.HalfNormal("eta", sigma=5)
+        sigma = pm.HalfNormal("sigma", sigma=5)
+        cov = eta**2 * pm.gp.cov.ExpQuad(1, ls=ls)
+        gp = pm.gp.Latent(cov_func=cov)
+        f = gp.prior("f", X=x[:, None])
+        pm.Normal("y", mu=f, sigma=sigma, observed=y_obs)
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Compile + Optimize
 # ---------------------------------------------------------------------------
@@ -160,6 +175,7 @@ def run_benchmarks_and_plot():
         ("Normal\n(2 params)", make_normal_model, "compiled_models/normal"),
         ("LinReg\n(3 params)", make_linreg_model, "compiled_models/linreg"),
         ("Hierarchical\n(12 params)", make_hierarchical_model, "compiled_models/hierarchical"),
+        ("GP\n(3 params)", make_gp_model, "compiled_models/gp"),
     ]
 
     n_evals = 200_000
@@ -292,6 +308,21 @@ y ~ Normal(a[group_idx] + b * x, sigma_y), observed
         make_hierarchical_model,
         source_code=hier_source,
         build_dir="compiled_models/hierarchical",
+    )
+
+    # Part 2b: PyMC → Rust compile + optimize (GP)
+    gp_source = """
+ls ~ HalfNormal(5)
+eta ~ HalfNormal(5)
+sigma ~ HalfNormal(5)
+K = eta^2 * ExpQuad(x, ls) + sigma^2 * I
+y ~ MvNormal(0, K), observed
+"""
+    gp_compile, gp_opt = run_compile_and_optimize(
+        "GP",
+        make_gp_model,
+        source_code=gp_source,
+        build_dir="compiled_models/gp",
     )
 
     # Part 3: Benchmark comparison
