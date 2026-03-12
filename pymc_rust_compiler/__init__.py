@@ -30,7 +30,13 @@ from pymc_rust_compiler.pytorch_rust_transpiler import (
 # PyMC/Stan imports are lazy — they pull in heavy deps (pymc, bridgestan)
 if TYPE_CHECKING:
     from pymc_rust_compiler.exporter import ModelContext, RustModelExporter, export_model
-    from pymc_rust_compiler.compiler import compile_model, optimize_model
+    from pymc_rust_compiler.compiler import compile_model, optimize_model, OptimizationEvent
+    from pymc_rust_compiler.analysis import (
+        plot_optimization_progress,
+        plot_waterfall,
+        plot_timeline,
+        print_summary,
+    )
     from pymc_rust_compiler.stan_exporter import (
         StanModelContext,
         StanModelExporter,
@@ -48,6 +54,11 @@ def __getattr__(name: str):
         "export_model": ("pymc_rust_compiler.exporter", "export_model"),
         "compile_model": ("pymc_rust_compiler.compiler", "compile_model"),
         "optimize_model": ("pymc_rust_compiler.compiler", "optimize_model"),
+        "OptimizationEvent": ("pymc_rust_compiler.compiler", "OptimizationEvent"),
+        "plot_optimization_progress": ("pymc_rust_compiler.analysis", "plot_optimization_progress"),
+        "plot_waterfall": ("pymc_rust_compiler.analysis", "plot_waterfall"),
+        "plot_timeline": ("pymc_rust_compiler.analysis", "plot_timeline"),
+        "print_summary": ("pymc_rust_compiler.analysis", "print_summary"),
         "StanModelContext": ("pymc_rust_compiler.stan_exporter", "StanModelContext"),
         "StanModelExporter": ("pymc_rust_compiler.stan_exporter", "StanModelExporter"),
         "export_stan_model": ("pymc_rust_compiler.stan_exporter", "export_stan_model"),
@@ -67,6 +78,12 @@ __all__ = [
     # PyMC → Rust (lazy)
     "compile_model",
     "optimize_model",
+    "OptimizationEvent",
+    # Analysis / plotting
+    "plot_optimization_progress",
+    "plot_waterfall",
+    "plot_timeline",
+    "print_summary",
     "export_model",
     "ModelContext",
     "RustModelExporter",

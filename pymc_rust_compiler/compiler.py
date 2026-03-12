@@ -13,7 +13,9 @@ model compiles and validates correctly.
 
 from __future__ import annotations
 
+import csv
 import functools
+import hashlib
 import json
 import os
 import re
@@ -433,6 +435,25 @@ _SKILL_BUILD_RS: dict[str, str] = {
 
 
 @dataclass
+class OptimizationEvent:
+    """A single event in the optimization loop (benchmark, build, validation).
+
+    Mirrors Karpathy's autoresearch results.tsv format, adapted for
+    Bayesian model compilation. Collected events enable autoresearcher-style
+    progress plots (see analysis.py).
+    """
+
+    turn: int
+    timestamp: float  # wall-clock seconds since loop start
+    event_type: str  # "benchmark" | "build" | "validation" | "write_code"
+    status: str  # "KEEP" | "DISCARD" | "CRASH" | "PASS" | "FAIL"
+    us_per_eval: float | None = None  # only for benchmark events
+    description: str = ""
+    code_hash: str = ""  # short hash of generated.rs at this point
+    token_usage: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class CompilationResult:
     """Result of compiling a PyMC model to Rust."""
 
@@ -448,10 +469,54 @@ class CompilationResult:
         "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
     })
     us_per_eval: float | None = None  # benchmark result if available
+    optimization_log: list[OptimizationEvent] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
         return self.logp_validated
+
+    def write_results_tsv(self, path: str | Path | None = None) -> Path:
+        """Write optimization log to a TSV file (autoresearch format).
+
+        Args:
+            path: Output path. Defaults to <build_dir>/results.tsv.
+
+        Returns:
+            Path to the written TSV file.
+        """
+        if path is None:
+            if self.build_dir is None:
+                raise ValueError("No build_dir set and no explicit path given")
+            path = Path(self.build_dir) / "results.tsv"
+        else:
+            path = Path(path)
+
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow([
+                "turn", "timestamp_s", "event_type", "status",
+                "us_per_eval", "code_hash", "description",
+            ])
+            for ev in self.optimization_log:
+                writer.writerow([
+                    ev.turn,
+                    f"{ev.timestamp:.2f}",
+                    ev.event_type,
+                    ev.status,
+                    f"{ev.us_per_eval:.3f}" if ev.us_per_eval is not None else "",
+                    ev.code_hash,
+                    ev.description,
+                ])
+
+        return path
+
+
+def _code_hash(build_path: Path) -> str:
+    """Return a short SHA-256 hash of the current generated.rs."""
+    gen = build_path / "src" / "generated.rs"
+    if gen.exists():
+        return hashlib.sha256(gen.read_bytes()).hexdigest()[:8]
+    return ""
 
 
 @dataclass
@@ -466,6 +531,8 @@ class _AgentState:
     validations: int = 0
     validated: bool = False
     timings: dict = field(default_factory=dict)
+    optimization_log: list[OptimizationEvent] = field(default_factory=list)
+    t0_loop: float = field(default_factory=time.time)
 
 
 def compile_model(
@@ -637,7 +704,7 @@ def compile_model(
             f"Agent did not achieve validation after {state.tool_calls} tool calls"
         )
 
-    return CompilationResult(
+    result = CompilationResult(
         rust_code=rust_code,
         logp_validated=state.validated,
         validation_errors=validation_errors,
@@ -651,7 +718,16 @@ def compile_model(
             "output_tokens": total_output_tokens,
             "total_tokens": total_input_tokens + total_output_tokens,
         },
+        optimization_log=state.optimization_log,
     )
+
+    # Auto-write results.tsv if there are logged events
+    if state.optimization_log:
+        tsv_path = result.write_results_tsv()
+        if verbose:
+            print(f"  Wrote {len(state.optimization_log)} events to {tsv_path}")
+
+    return result
 
 
 def _execute_tool(
@@ -701,6 +777,15 @@ def _tool_write_rust_code(
     if verbose:
         print(f"  [write_rust_code] Wrote {len(code)} chars to generated.rs")
 
+    state.optimization_log.append(OptimizationEvent(
+        turn=state.tool_calls,
+        timestamp=time.time() - state.t0_loop,
+        event_type="write_code",
+        status="OK",
+        description=f"Wrote {len(code)} chars",
+        code_hash=_code_hash(state.build_path),
+    ))
+
     return f"Written {len(code)} chars to src/generated.rs"
 
 
@@ -729,10 +814,26 @@ def _tool_cargo_build(state: _AgentState, verbose: bool) -> str:
     if result.returncode == 0:
         if verbose:
             print(f"  [cargo_build] OK ({elapsed:.1f}s)")
+        state.optimization_log.append(OptimizationEvent(
+            turn=state.tool_calls,
+            timestamp=time.time() - state.t0_loop,
+            event_type="build",
+            status="PASS",
+            description=f"Build OK ({elapsed:.1f}s)",
+            code_hash=_code_hash(state.build_path),
+        ))
         return f"Build successful ({elapsed:.1f}s)"
     else:
         if verbose:
             print(f"  [cargo_build] FAILED ({elapsed:.1f}s)")
+        state.optimization_log.append(OptimizationEvent(
+            turn=state.tool_calls,
+            timestamp=time.time() - state.t0_loop,
+            event_type="build",
+            status="CRASH",
+            description=f"Build FAILED ({elapsed:.1f}s)",
+            code_hash=_code_hash(state.build_path),
+        ))
         # Return compiler errors (truncated to avoid token explosion)
         errors = result.stderr
         if len(errors) > 4000:
@@ -861,10 +962,26 @@ def _tool_validate_logp(state: _AgentState, verbose: bool) -> str:
         state.validated = True
         if verbose:
             print(f"  [validate_logp] PASSED!")
+        state.optimization_log.append(OptimizationEvent(
+            turn=state.tool_calls,
+            timestamp=time.time() - state.t0_loop,
+            event_type="validation",
+            status="PASS",
+            description="Validation passed",
+            code_hash=_code_hash(state.build_path),
+        ))
         return f"VALIDATION PASSED!\n\n{report}"
     else:
         if verbose:
             print(f"  [validate_logp] FAILED ({len(errors)} errors)")
+        state.optimization_log.append(OptimizationEvent(
+            turn=state.tool_calls,
+            timestamp=time.time() - state.t0_loop,
+            event_type="validation",
+            status="FAIL",
+            description=f"Validation failed ({len(errors)} errors)",
+            code_hash=_code_hash(state.build_path),
+        ))
         return f"VALIDATION FAILED ({len(errors)} errors):\n\n{report}\n\nErrors:\n" + "\n".join(errors)
 
 
@@ -1254,6 +1371,16 @@ def _bench_logp_tool(state: _AgentState, verbose: bool) -> str:
     if verbose:
         print(f"  [bench_logp] {us_per_eval:.3f} us/eval ({n_evals:,} evaluations)")
 
+    state.optimization_log.append(OptimizationEvent(
+        turn=state.tool_calls,
+        timestamp=time.time() - state.t0_loop,
+        event_type="benchmark",
+        status="OK",
+        us_per_eval=us_per_eval,
+        description=f"{us_per_eval:.3f} us/eval",
+        code_hash=_code_hash(state.build_path),
+    ))
+
     return f"Benchmark: {us_per_eval:.3f} us/eval ({n_evals:,} evaluations, {1e6/us_per_eval:,.0f} evals/sec)"
 
 
@@ -1394,11 +1521,22 @@ def optimize_model(
                 state.tool_calls += 1
                 if block.name == "bench_logp":
                     result = _bench_logp_tool(state, verbose)
-                    # Track best timing
+                    # Track best timing and update log status
                     if "us/eval" in result and "Error" not in result:
                         us = float(result.split()[1])
                         if best_us is None or us < best_us:
                             best_us = us
+                            # Mark the last benchmark event as KEEP
+                            for ev in reversed(state.optimization_log):
+                                if ev.event_type == "benchmark":
+                                    ev.status = "KEEP"
+                                    break
+                        else:
+                            # Mark as DISCARD — no improvement
+                            for ev in reversed(state.optimization_log):
+                                if ev.event_type == "benchmark":
+                                    ev.status = "DISCARD"
+                                    break
                 else:
                     result = _execute_tool(block.name, block.input, state, verbose)
                 tool_results.append({
@@ -1412,7 +1550,7 @@ def optimize_model(
     # Read final code
     final_code = (build_path / "src" / "generated.rs").read_text()
 
-    return CompilationResult(
+    result = CompilationResult(
         rust_code=final_code,
         logp_validated=state.validated or compile_result.logp_validated,
         validation_errors=[],
@@ -1427,4 +1565,13 @@ def optimize_model(
             "total_tokens": total_input_tokens + total_output_tokens,
         },
         us_per_eval=best_us,
+        optimization_log=state.optimization_log,
     )
+
+    # Auto-write results.tsv
+    if state.optimization_log:
+        tsv_path = result.write_results_tsv()
+        if verbose:
+            print(f"  Wrote {len(state.optimization_log)} events to {tsv_path}")
+
+    return result
