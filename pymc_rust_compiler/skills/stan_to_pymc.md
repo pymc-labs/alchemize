@@ -3,6 +3,29 @@
 You are translating a **Stan model** to **PyMC (v5+)**. Pay close attention to
 the differences between Stan and PyMC conventions.
 
+## Core Translation Principles
+
+These rules are **mandatory** — violating them produces slow, unidiomatic, or broken models:
+
+1. **Always vectorize.** Never use Python `for` loops to create distributions or build up
+   likelihood terms. Use `shape`/`dims`, array indexing, and numpy-like broadcasting instead.
+   A Stan `for` loop over independent iterations should become a single vectorized distribution
+   call in PyMC.
+
+2. **Use `pytensor.scan` for sequential dependencies.** When step `t` depends on step `t-1`
+   (AR, MA, state-space, ODEs), use `pytensor.scan` — never a Python `for` loop. Python loops
+   unroll the graph and create one node per iteration; `scan` compiles the loop into a single
+   graph node. Use `pm.AR` for standard AR(p) models.
+
+3. **Use `pt.switch`/`ifelse` for branching.** You **cannot** use Python `if/else` on symbolic
+   PyTensor variables — they have no concrete value at graph construction time. Use `pt.switch`
+   (element-wise, like `np.where`) for most cases, or `pytensor.ifelse.ifelse` for scalar
+   conditions with expensive branches.
+
+4. **Prefer numpy-like syntax throughout.** Use `pt.dot`, `pt.sum`, `pt.stack`, `pt.concatenate`,
+   broadcasting, and advanced indexing. Write array expressions the way you would in NumPy.
+   Avoid building results element-by-element or accumulating in Python lists.
+
 ## Stan Block → PyMC Mapping
 
 | Stan Block | PyMC Equivalent |
@@ -672,6 +695,35 @@ for (k in 1:K)
 # PyMC — single dot product
 mu = pt.dot(X_data, beta)
 ```
+
+### Never accumulate in Python lists — use array operations
+
+```python
+# WRONG — builds list then stacks, creating unnecessary graph nodes
+mu_list = []
+for t in range(K, T):
+    mu_t = alpha
+    for k in range(K):
+        mu_t = mu_t + beta[k] * y_data[t - k - 1]
+    mu_list.append(mu_t)
+mu = pt.stack(mu_list)
+
+# CORRECT — vectorized with array slicing and dot product
+# Build a lagged matrix and use a single dot product
+Y_lagged = pt.stack([y_data[K-k-1:T-k-1] for k in range(K)], axis=1)
+mu = alpha + pt.dot(Y_lagged, beta)
+```
+
+### Common vectorization patterns
+
+| Stan pattern | PyMC equivalent |
+|---|---|
+| `for (n in 1:N) y[n] ~ dist(f(n))` | `pm.Dist("y", f_vectorized, observed=y_data)` |
+| `for (n in 1:N) target += g(y[n])` | `pm.Potential("name", pt.sum(g(y_data)))` |
+| Accumulate in a loop | `pt.dot`, `pt.sum`, `pt.cumsum`, `pt.cumprod` |
+| Build array element-by-element | `pt.stack`, `pt.concatenate`, broadcasting |
+| Conditional per element | `pt.switch(condition_array, a, b)` |
+| Index with loop variable | Advanced indexing: `params[index_array]` |
 
 ## Looping with `pytensor.scan` (Sequential Dependencies)
 
