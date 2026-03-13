@@ -96,8 +96,8 @@ def make_gp_model():
 
 def run_compile_and_optimize(name, make_model_fn, source_code, build_dir):
     """Compile a PyMC model to Rust, then optimize it."""
-    from pymc_rust_compiler import compile_model, optimize_model
-    from pymc_rust_compiler.analysis import (
+    from transpailer import compile_model, optimize_model
+    from transpailer.analysis import (
         plot_optimization_progress,
         plot_waterfall,
         plot_timeline,
@@ -165,7 +165,7 @@ def run_compile_and_optimize(name, make_model_fn, source_code, build_dir):
 
 def run_benchmarks_and_plot():
     """Run logp benchmarks on compiled models and generate comparison bar chart."""
-    from pymc_rust_compiler.benchmark import (
+    from transpailer.benchmark import (
         _make_test_point,
         benchmark_logp_pytensor,
         benchmark_logp_rust,
