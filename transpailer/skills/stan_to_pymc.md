@@ -22,9 +22,22 @@ These rules are **mandatory** — violating them produces slow, unidiomatic, or 
    (element-wise, like `np.where`) for most cases, or `pytensor.ifelse.ifelse` for scalar
    conditions with expensive branches.
 
-4. **Prefer numpy-like syntax throughout.** Use `pt.dot`, `pt.sum`, `pt.stack`, `pt.concatenate`,
-   broadcasting, and advanced indexing. Write array expressions the way you would in NumPy.
+4. **Prefer numpy-like syntax throughout.** Use `@` (matmul operator), `pt.sum`, `pt.stack`,
+   `pt.concatenate`, broadcasting, and advanced indexing. Write array expressions the way you
+   would in NumPy. Use `A @ B` instead of `pt.dot(A, B)` or `pm.math.dot(A, B)`.
    Avoid building results element-by-element or accumulating in Python lists.
+
+5. **Data wrangling before `pm.Model()`.** Extract and preprocess data (index conversions,
+   matrix construction, etc.) BEFORE the `with pm.Model()` context. Keep the model block
+   focused on the probabilistic model definition.
+
+6. **Use proper distributions, not Flat+Potential.** When Stan has an explicit prior like
+   `theta ~ normal(0, 36)`, use `pm.Normal("theta", mu=0, sigma=36)` directly. Do NOT use
+   `pm.Flat("theta")` + `pm.Potential("theta_prior", ...)` to manually add the log-probability.
+   Only use `pm.Flat`/`pm.HalfFlat` when Stan truly has no explicit prior (implicit uniform).
+
+7. **No shape=1 special cases.** `pm.Flat("x", shape=1)` works correctly — do NOT add
+   `if size == 1: scalar = pm.Flat("x"); x = pt.stack([scalar])` workarounds.
 
 ## Stan Block → PyMC Mapping
 
@@ -193,7 +206,7 @@ model {
 with pm.Model() as model:
     beta = pm.Normal("beta", mu=0, sigma=10, shape=K)
     sigma = pm.HalfNormal("sigma", sigma=5)
-    mu = pm.math.dot(X_data, beta)
+    mu = X_data @ beta
     y_obs = pm.Normal("y", mu=mu, sigma=sigma, observed=y_data)
 ```
 
@@ -217,6 +230,20 @@ y ~ normal(mu, sigma) T[0,];  // truncated below at 0
 ```
 ```python
 y = pm.TruncatedNormal("y", mu=mu, sigma=sigma, lower=0)
+# Or more generally:
+y = pm.Truncated("y", pm.Normal.dist(mu=mu, sigma=sigma), lower=0)
+```
+
+For truncated Student-t (common in brms-generated Stan models):
+```stan
+real<lower=0> sdgp ~ student_t(3, 0, 36);
+```
+```python
+# Use pm.HalfStudentT for mu=0 case:
+sdgp = pm.HalfStudentT("sdgp", nu=3, sigma=36)
+# Or pm.Truncated for general case:
+sdgp = pm.Truncated("sdgp", pm.StudentT.dist(nu=3, mu=0, sigma=36), lower=0)
+# Do NOT use pm.TruncatedNormal + correction Potential hack
 ```
 
 ## Stan Functions → PyMC/PyTensor Equivalents
@@ -232,7 +259,7 @@ y = pm.TruncatedNormal("y", mu=mu, sigma=sigma, lower=0)
 | `inv_logit(x)` | `pm.math.invlogit(x)` |
 | `logit(x)` | `pm.math.logit(x)` |
 | `log1p(x)` | `pt.log1p(x)` |
-| `dot_product(x, y)` | `pt.dot(x, y)` |
+| `dot_product(x, y)` | `x @ y` |
 | `sum(x)` | `pt.sum(x)` or `x.sum()` |
 | `mean(x)` | `pt.mean(x)` |
 | `sd(x)` | `pt.std(x)` |
@@ -245,52 +272,29 @@ y = pm.TruncatedNormal("y", mu=mu, sigma=sigma, lower=0)
 | `cholesky_decompose(M)` | `pt.linalg.cholesky(M)` |
 | `inverse(M)` | `pt.linalg.inv(M)` |
 | `determinant(M)` | `pt.linalg.det(M)` |
-| `quad_form(A, b)` | `pt.dot(b.T, pt.dot(A, b))` |
+| `quad_form(A, b)` | `b.T @ A @ b` |
 | `multiply(A, B)` | `A * B` (element-wise) |
 
-## Critical: Half-Distribution log(2) Mismatch (Stan vs PyMC)
+## Half-Distribution Mapping (Stan vs PyMC)
 
-**This is the #1 source of logp validation failures when transpiling Stan → PyMC.**
+When Stan declares `real<lower=0> sigma; sigma ~ cauchy(0, 5);`, use PyMC's dedicated
+Half distributions directly. The `log(2)` normalization difference between Stan and PyMC
+is a constant that does NOT affect sampling or gradient-based inference.
 
-When Stan declares `real<lower=0> sigma; sigma ~ cauchy(0, 5);`, it evaluates the
-**full Cauchy density** on the positive half-line WITHOUT normalizing. PyMC's
-`pm.HalfCauchy('sigma', beta=5)` uses a properly normalized half-distribution that
-adds `log(2)` to the logp (since `pdf_half(x) = 2 * pdf_full(x)` for `x > 0`).
+**Do NOT add correction Potentials.** They clutter the model and are unnecessary.
 
-This creates an **exact `log(2)` offset per Half* parameter** in logp comparisons.
+| Stan Pattern | PyMC |
+|---|---|
+| `real<lower=0> x ~ cauchy(0, s)` | `pm.HalfCauchy("x", beta=s)` |
+| `real<lower=0> x ~ normal(0, s)` | `pm.HalfNormal("x", sigma=s)` |
+| `real<lower=0> x ~ student_t(nu, 0, s)` | `pm.HalfStudentT("x", nu=nu, sigma=s)` |
+| `real<lower=0> x` (no prior) | `pm.HalfFlat("x")` |
 
-### How to handle it
-
-**Option A (recommended for logp validation):** Use the Half distribution and add a
-correction potential:
-
+For truncated distributions with non-zero location or non-standard distributions:
 ```python
-n_half_params = 0  # count how many Half* distributions you use
-
-sigma = pm.HalfCauchy("sigma", beta=5)  # Stan: real<lower=0> sigma ~ cauchy(0,5)
-n_half_params += 1
-
-tau = pm.HalfNormal("tau", sigma=1)  # Stan: real<lower=0> tau ~ normal(0,1)
-n_half_params += 1
-
-# Correct the log(2) offset for exact logp match with Stan
-pm.Potential("half_dist_correction", -n_half_params * pt.log(2.0))
+# Stan: real<lower=0> y ~ student_t(3, 0, 36) T[0,];
+y = pm.Truncated("y", pm.StudentT.dist(nu=3, mu=0, sigma=36), lower=0)
 ```
-
-**Option B:** Use Gamma/InverseGamma/Exponential distributions that naturally have
-positive support (no `log(2)` issue since they're not "half" versions of symmetric
-distributions).
-
-### Affected patterns
-
-| Stan Pattern | Naive PyMC (WRONG logp) | Corrected PyMC |
-|---|---|---|
-| `real<lower=0> x ~ cauchy(0, s)` | `pm.HalfCauchy(beta=s)` | + correction potential |
-| `real<lower=0> x ~ normal(0, s)` | `pm.HalfNormal(sigma=s)` | + correction potential |
-| `real<lower=0> x ~ student_t(nu, 0, s)` | `pm.HalfStudentT(nu=nu, sigma=s)` | + correction potential |
-| `real<lower=0> x` (no prior) | `pm.HalfFlat()` | + correction potential |
-
-See: https://github.com/pymc-devs/pymc/issues/8186
 
 ## Transformed Data Block
 
@@ -567,7 +571,7 @@ with pm.Model(coords=coords) as model:
     alpha = pm.Normal("alpha", mu=0, sigma=10, dims="group")
     sigma = pm.HalfNormal("sigma", sigma=5)
 
-    mu = pm.math.dot(X_data, beta) + alpha[group_idx]
+    mu = X_data @ beta + alpha[group_idx]
     pm.Normal("y", mu=mu, sigma=sigma, observed=y_data, dims="obs")
 ```
 
@@ -634,8 +638,8 @@ fixed constants, enabling additional graph optimizations.
 2. **Column-major vs row-major**: Stan uses column-major matrices, NumPy uses row-major.
    When converting matrix data, transpose if needed.
 3. **Half distributions**: Stan uses `normal(0, s)` with `<lower=0>` constraint. PyMC has
-   dedicated `pm.HalfNormal`, `pm.HalfCauchy`, etc. **BUT they differ by `log(2)` in logp!**
-   See the "Half-Distribution log(2) Mismatch" section above.
+   dedicated `pm.HalfNormal`, `pm.HalfCauchy`, `pm.HalfStudentT`. Use them directly —
+   the `log(2)` normalization difference is a constant that doesn't affect sampling.
 4. **Improper priors**: Stan's `real` with no prior = improper uniform. In PyMC use
    `pm.Flat()` or (better) specify an explicit prior.
 5. **Observed data**: Pass as `observed=` kwarg to the likelihood distribution. Data should
@@ -683,7 +687,7 @@ for (n in 1:N)
 pm.Normal("y", mu=alpha[group_idx], sigma=sigma, observed=y_data)
 ```
 
-### Use `pt.dot`, `pt.sum`, `pt.stack` for linear algebra
+### Use `@`, `pt.sum`, `pt.stack` for linear algebra
 
 ```stan
 // Stan
@@ -692,8 +696,8 @@ for (k in 1:K)
     total += beta[k] * X[n, k];
 ```
 ```python
-# PyMC — single dot product
-mu = pt.dot(X_data, beta)
+# PyMC — single matmul
+mu = X_data @ beta
 ```
 
 ### Never accumulate in Python lists — use array operations
@@ -711,7 +715,7 @@ mu = pt.stack(mu_list)
 # CORRECT — vectorized with array slicing and dot product
 # Build a lagged matrix and use a single dot product
 Y_lagged = pt.stack([y_data[K-k-1:T-k-1] for k in range(K)], axis=1)
-mu = alpha + pt.dot(Y_lagged, beta)
+mu = alpha + Y_lagged @ beta
 ```
 
 ### Common vectorization patterns
@@ -720,7 +724,7 @@ mu = alpha + pt.dot(Y_lagged, beta)
 |---|---|
 | `for (n in 1:N) y[n] ~ dist(f(n))` | `pm.Dist("y", f_vectorized, observed=y_data)` |
 | `for (n in 1:N) target += g(y[n])` | `pm.Potential("name", pt.sum(g(y_data)))` |
-| Accumulate in a loop | `pt.dot`, `pt.sum`, `pt.cumsum`, `pt.cumprod` |
+| Accumulate in a loop | `@` (matmul), `pt.sum`, `pt.cumsum`, `pt.cumprod` |
 | Build array element-by-element | `pt.stack`, `pt.concatenate`, broadcasting |
 | Conditional per element | `pt.switch(condition_array, a, b)` |
 | Index with loop variable | Advanced indexing: `params[index_array]` |
