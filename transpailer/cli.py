@@ -90,6 +90,45 @@ def _load_skills(source: str, target: str) -> str:
     return "\n\n".join(parts)
 
 
+def _load_skill_by_name_or_path(skill: str) -> str:
+    """Load a skill by name (from skills/refine/) or by file path."""
+    # Try as file path first
+    skill_path = Path(skill)
+    if skill_path.exists():
+        return skill_path.read_text()
+
+    # Try as name in skills/refine/
+    refine_path = _SKILLS_DIR / "refine" / f"{skill}.md"
+    if refine_path.exists():
+        return refine_path.read_text()
+
+    # Try as name in skills/ directly
+    direct_path = _SKILLS_DIR / f"{skill}.md"
+    if direct_path.exists():
+        return direct_path.read_text()
+
+    raise click.ClickException(
+        f"Skill '{skill}' not found. Looked in:\n"
+        f"  - {skill_path}\n"
+        f"  - {refine_path}\n"
+        f"  - {direct_path}"
+    )
+
+
+_REFINE_SYSTEM_PROMPT = """\
+You are the Transpailer — an expert AI that refines and improves existing code. \
+You apply specific coding standards and style guidelines to make code more idiomatic \
+and clean.
+
+Rules:
+1. Output ONLY the refined code — no explanations, no markdown fences.
+2. Preserve the mathematical/computational semantics EXACTLY — do not change behavior.
+3. Apply all the guidelines from the skill/instructions provided.
+4. Do not add new features or change the model logic.
+5. Keep the same function signature and return type.
+"""
+
+
 _SYSTEM_PROMPT = """\
 You are the Transpailer — an expert AI that transpiles code between computational \
 frameworks. You produce clean, idiomatic code in the target framework that is \
@@ -260,3 +299,140 @@ def convert(
             click.echo(f"Written to {output}", err=True)
     else:
         click.echo(result)
+
+
+def _refine(
+    code: str,
+    skill_text: str,
+    *,
+    model: str = "claude-sonnet-4-20250514",
+    verbose: bool = False,
+) -> str:
+    """Call Claude to refine existing code using a skill."""
+    import anthropic
+
+    system = _REFINE_SYSTEM_PROMPT + f"\n\n# Refinement guidelines\n\n{skill_text}"
+
+    user_msg = (
+        "Refine the following code according to the guidelines above. "
+        "Output only the improved code.\n\n"
+        f"```\n{code}\n```"
+    )
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise click.ClickException(
+            "ANTHROPIC_API_KEY environment variable is required. "
+            "Set it with: export ANTHROPIC_API_KEY=sk-..."
+        )
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    if verbose:
+        click.echo(f"  Calling {model}...", err=True)
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=16384,
+        system=system,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+
+    result = response.content[0].text
+
+    # Strip markdown code fences if the model wrapped its output
+    result = re.sub(r"^```\w*\n", "", result)
+    result = re.sub(r"\n```\s*$", "", result)
+
+    if verbose:
+        usage = response.usage
+        click.echo(
+            f"  Tokens: {usage.input_tokens} in / {usage.output_tokens} out",
+            err=True,
+        )
+
+    return result
+
+
+@cli.command()
+@click.argument("input_files", nargs=-1, required=True)
+@click.option(
+    "--skill",
+    required=True,
+    help="Skill name (from skills/refine/) or path to a .md file",
+)
+@click.option(
+    "--in-place",
+    is_flag=True,
+    help="Write refined code back to the input file",
+)
+@click.option(
+    "-o",
+    "--output-dir",
+    type=click.Path(),
+    default=None,
+    help="Output directory (default: stdout)",
+)
+@click.option(
+    "--model",
+    default="claude-sonnet-4-20250514",
+    help="Claude model to use",
+    show_default=True,
+)
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output on stderr")
+def refine(
+    input_files: tuple[str, ...],
+    skill: str,
+    in_place: bool,
+    output_dir: str | None,
+    model: str,
+    verbose: bool,
+) -> None:
+    """Refine existing code using a skill (style/idiomaticity pass).
+
+    \b
+    Examples:
+      transpailer refine model.py --skill pymc_idiomaticity --in-place
+      transpailer refine models/*.py --skill /tmp/review_fixes.md --in-place -v
+      transpailer refine model.py --skill pymc_idiomaticity -o refined/
+    """
+    import glob as globmod
+
+    # Expand globs
+    files: list[Path] = []
+    for pattern in input_files:
+        expanded = globmod.glob(pattern)
+        if not expanded:
+            raise click.UsageError(f"No files match: {pattern}")
+        files.extend(Path(f) for f in sorted(expanded))
+
+    skill_text = _load_skill_by_name_or_path(skill)
+
+    if verbose:
+        click.echo(f"Loaded skill: {skill}", err=True)
+        click.echo(f"Processing {len(files)} file(s)...", err=True)
+
+    for i, filepath in enumerate(files, 1):
+        if verbose:
+            click.echo(f"[{i}/{len(files)}] {filepath.name}", err=True)
+
+        code = filepath.read_text()
+        result = _refine(code, skill_text, model=model, verbose=verbose)
+
+        if in_place:
+            filepath.write_text(result)
+            if verbose:
+                click.echo(f"  Written to {filepath}", err=True)
+        elif output_dir:
+            out_path = Path(output_dir) / filepath.name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(result)
+            if verbose:
+                click.echo(f"  Written to {out_path}", err=True)
+        else:
+            click.echo(f"# ── {filepath.name} ──")
+            click.echo(result)
+            click.echo()
+
+    if verbose:
+        click.echo(f"Done. Refined {len(files)} file(s).", err=True)

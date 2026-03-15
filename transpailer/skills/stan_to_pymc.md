@@ -654,6 +654,50 @@ fixed constants, enabling additional graph optimizations.
 9. **binomial_logit**: Stan's `binomial_logit(n, alpha)` = `pm.Binomial("x", n=n, logit_p=alpha)`.
    Do NOT manually apply `invlogit` — use the `logit_p` parameter directly.
 
+## Idiomaticity Rules
+
+These rules ensure the output looks like code a PyMC expert would write:
+
+1. **Minimal comments.** Let the code speak. Only add comments when the logic is genuinely
+   non-obvious. Never add comments like "# Priors", "# Likelihood", "# Parameters",
+   "# Extract data", or comments that just restate the code. Never leave dangling comments
+   about "normalization correction" or "matching Stan" for adjustments that are not applied.
+
+2. **Deterministic before likelihood.** When a transformed parameter appears in both a
+   `pm.Deterministic` and a likelihood, define the Deterministic FIRST and reference its
+   variable in the likelihood. Never duplicate the expression.
+   ```python
+   # WRONG — expression duplicated
+   pm.Normal("y", mu=alpha + X @ beta, sigma=sigma, observed=y_data)
+   mu = pm.Deterministic("mu", alpha + X @ beta)
+
+   # CORRECT — define once, use twice
+   mu = pm.Deterministic("mu", alpha + X @ beta)
+   pm.Normal("y", mu=mu, sigma=sigma, observed=y_data)
+   ```
+
+3. **Consistent `prior_only` flag.** Always accept a `prior_only=False` parameter in
+   `make_model`. Wrap the likelihood in `if not prior_only:`. This allows the model to
+   be used for prior predictive checks without observed data.
+   ```python
+   def make_model(data: dict, prior_only: bool = False) -> pm.Model:
+       ...
+       with pm.Model() as model:
+           ...
+           if not prior_only:
+               pm.Normal("y", mu=mu, sigma=sigma, observed=y_data)
+       return model
+   ```
+
+4. **Variable names must match semantics.** If a variable holds a logit-scale quantity,
+   name it `logit_p` not `p`. If it holds a log-scale quantity, name it `log_mu` not `mu`.
+
+5. **Use built-in mixture distributions.** Use `pm.NormalMixture` instead of manual
+   mixture constructions with `pt.log` and `pm.Potential` when applicable.
+
+6. **No dead code.** Never leave commented-out code, unused variables, or dangling logic
+   from removed features (e.g., Potential corrections that were deleted).
+
 ## Vectorization: Prefer Array Operations Over Python Loops
 
 **This is critical for performance.** Stan models often use `for` loops; PyMC models should
