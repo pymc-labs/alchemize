@@ -40,8 +40,8 @@ Hardware is auto-detected: CUDA → Accelerate (Apple Silicon) → CPU fallback.
 | Normal | 2 | 4 | 40K | First try |
 | Linear Regression | 3 | 4 | 54K | First try |
 | Hierarchical | 12 | 8 | 153K | Fixed gradients in 1 retry |
-| GP (ExpQuad) | 3 | 11 | 467K | Passed (GP skill) |
-| ZeroSumNormal | 142 | 9 | 484K | Passed (ZeroSumNormal skill) |
+| GP (ExpQuad) | 3 | 11 | 467K | 3 retries (GP skill) |
+| ZeroSumNormal | 142 | 9 | 484K | 2 retries (ZeroSumNormal skill) |
 
 ### Runtime: logp+dlogp evaluation speed
 
