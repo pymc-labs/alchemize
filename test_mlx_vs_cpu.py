@@ -3,8 +3,8 @@
 import numpy as np
 import pymc as pm
 
-from transalchemy import compile_model
-from transalchemy.benchmark import (
+from alchemize import compile_model
+from alchemize.benchmark import (
     benchmark_logp_pytensor,
     benchmark_logp_rust,
 )

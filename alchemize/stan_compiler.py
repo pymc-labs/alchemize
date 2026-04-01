@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from transalchemy.stan_exporter import StanModelExporter
+from alchemize.stan_exporter import StanModelExporter
 
 _SKILLS_DIR = Path(__file__).parent / "skills"
 

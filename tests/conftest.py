@@ -1,4 +1,4 @@
-"""Shared fixtures for transalchemy tests."""
+"""Shared fixtures for alchemize tests."""
 
 from __future__ import annotations
 

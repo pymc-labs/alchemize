@@ -5,7 +5,7 @@ Transpiles a Stan hierarchical (partial pooling) model to PyMC.
 
 import numpy as np
 
-from transalchemy import transpile_stan_to_pymc
+from alchemize import transpile_stan_to_pymc
 
 STAN_CODE = """
 data {

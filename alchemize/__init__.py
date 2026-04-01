@@ -8,94 +8,94 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING
 
-from transalchemy.jax_exporter import (
+from alchemize.jax_exporter import (
     JaxModelExporter,
     export_jax_model,
 )
 
 # JAX ↔ PyTorch (no heavy deps at import time)
-from transalchemy.jax_pytorch_transpiler import (
+from alchemize.jax_pytorch_transpiler import (
     TranspileResult,
     transpile_jax_to_pytorch,
     transpile_pytorch_to_jax,
 )
-from transalchemy.pytorch_exporter import (
+from alchemize.pytorch_exporter import (
     PytorchModelExporter,
     export_pytorch_model,
 )
-from transalchemy.pytorch_rust_transpiler import (
+from alchemize.pytorch_rust_transpiler import (
     RustTranspileResult,
     transpile_pytorch_to_rust,
 )
 
 # PyMC/Stan imports are lazy — they pull in heavy deps (pymc, bridgestan)
 if TYPE_CHECKING:
-    from transalchemy.analysis import (
+    from alchemize.analysis import (
         plot_optimization_progress,
         plot_timeline,
         plot_waterfall,
         print_summary,
     )
-    from transalchemy.compiler import (
+    from alchemize.compiler import (
         OptimizationEvent,
         compile_model,
         optimize_model,
     )
-    from transalchemy.exporter import (
+    from alchemize.exporter import (
         ModelContext,
         RustModelExporter,
         export_model,
     )
-    from transalchemy.stan_compiler import (
+    from alchemize.stan_compiler import (
         StanCompilationResult,
         compile_stan_model,
     )
-    from transalchemy.stan_exporter import (
+    from alchemize.stan_exporter import (
         StanModelContext,
         StanModelExporter,
         export_stan_model,
     )
-    from transalchemy.stan_to_pymc import StanToPyMCResult, transpile_stan_to_pymc
+    from alchemize.stan_to_pymc import StanToPyMCResult, transpile_stan_to_pymc
 
 
 def __getattr__(name: str):
     """Lazy import for PyMC/Stan components."""
     _lazy_imports = {
-        "ModelContext": ("transalchemy.exporter", "ModelContext"),
-        "RustModelExporter": ("transalchemy.exporter", "RustModelExporter"),
-        "export_model": ("transalchemy.exporter", "export_model"),
-        "compile_model": ("transalchemy.compiler", "compile_model"),
-        "optimize_model": ("transalchemy.compiler", "optimize_model"),
-        "OptimizationEvent": ("transalchemy.compiler", "OptimizationEvent"),
+        "ModelContext": ("alchemize.exporter", "ModelContext"),
+        "RustModelExporter": ("alchemize.exporter", "RustModelExporter"),
+        "export_model": ("alchemize.exporter", "export_model"),
+        "compile_model": ("alchemize.compiler", "compile_model"),
+        "optimize_model": ("alchemize.compiler", "optimize_model"),
+        "OptimizationEvent": ("alchemize.compiler", "OptimizationEvent"),
         "plot_optimization_progress": (
-            "transalchemy.analysis",
+            "alchemize.analysis",
             "plot_optimization_progress",
         ),
-        "plot_waterfall": ("transalchemy.analysis", "plot_waterfall"),
-        "plot_timeline": ("transalchemy.analysis", "plot_timeline"),
-        "print_summary": ("transalchemy.analysis", "print_summary"),
-        "StanModelContext": ("transalchemy.stan_exporter", "StanModelContext"),
-        "StanModelExporter": ("transalchemy.stan_exporter", "StanModelExporter"),
-        "export_stan_model": ("transalchemy.stan_exporter", "export_stan_model"),
+        "plot_waterfall": ("alchemize.analysis", "plot_waterfall"),
+        "plot_timeline": ("alchemize.analysis", "plot_timeline"),
+        "print_summary": ("alchemize.analysis", "print_summary"),
+        "StanModelContext": ("alchemize.stan_exporter", "StanModelContext"),
+        "StanModelExporter": ("alchemize.stan_exporter", "StanModelExporter"),
+        "export_stan_model": ("alchemize.stan_exporter", "export_stan_model"),
         "compile_stan_model": (
-            "transalchemy.stan_compiler",
+            "alchemize.stan_compiler",
             "compile_stan_model",
         ),
         "StanCompilationResult": (
-            "transalchemy.stan_compiler",
+            "alchemize.stan_compiler",
             "StanCompilationResult",
         ),
         "transpile_stan_to_pymc": (
-            "transalchemy.stan_to_pymc",
+            "alchemize.stan_to_pymc",
             "transpile_stan_to_pymc",
         ),
-        "StanToPyMCResult": ("transalchemy.stan_to_pymc", "StanToPyMCResult"),
+        "StanToPyMCResult": ("alchemize.stan_to_pymc", "StanToPyMCResult"),
     }
     if name in _lazy_imports:
         module_path, attr = _lazy_imports[name]
         module = importlib.import_module(module_path)
         return getattr(module, attr)
-    raise AttributeError(f"module 'transalchemy' has no attribute {name!r}")
+    raise AttributeError(f"module 'alchemize' has no attribute {name!r}")
 
 
 __all__ = [
@@ -137,6 +137,6 @@ __all__ = [
 
 def to_nutpie(compile_result, model):
     """Convert a CompilationResult to a nutpie-compatible model. Lazy import."""
-    from transalchemy.nutpie_bridge import to_nutpie as _to_nutpie
+    from alchemize.nutpie_bridge import to_nutpie as _to_nutpie
 
     return _to_nutpie(compile_result, model)

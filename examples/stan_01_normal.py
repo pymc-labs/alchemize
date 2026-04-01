@@ -5,7 +5,7 @@ Equivalent to examples/01_normal.py but starting from Stan code.
 
 import numpy as np
 
-from transalchemy import compile_stan_model
+from alchemize import compile_stan_model
 
 STAN_CODE = """
 data {
