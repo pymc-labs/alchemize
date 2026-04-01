@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transalchemy import transpile_pytorch_to_jax
+from alchemize import transpile_pytorch_to_jax
 
 
 class SimpleMLP(nn.Module):

@@ -5,7 +5,7 @@ Measures compilation and sampling times separately, runs multiple iterations,
 and stores convergence diagnostics (ESS, Rhat).
 
 Usage:
-    cd /path/to/transalchemy
+    cd /path/to/alchemize
     uv run python benchmarks/run_benchmarks.py [--models normal,linreg] [--n-repeats 3] [--output results.json]
 """
 
@@ -553,7 +553,7 @@ def benchmark_rust(
 
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
-        from transalchemy.nutpie_bridge import _ensure_ffi_setup, _load_logp_fn
+        from alchemize.nutpie_bridge import _ensure_ffi_setup, _load_logp_fn
 
         # Compilation: build the shared library
         t_compile_start = time.perf_counter()

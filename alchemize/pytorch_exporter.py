@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from transalchemy.jax_exporter import ModelContext, TensorInfo, ValidationPoint
+from alchemize.jax_exporter import ModelContext, TensorInfo, ValidationPoint
 
 
 class PytorchModelExporter:

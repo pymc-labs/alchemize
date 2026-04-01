@@ -12,7 +12,7 @@ for 2 unconstrained parameters: mu and log(sigma).
 import numpy as np
 import pymc as pm
 
-from transalchemy import compile_model
+from alchemize import compile_model
 
 # Generate synthetic data
 np.random.seed(42)

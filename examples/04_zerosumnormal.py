@@ -30,7 +30,7 @@ Unconstrained parameters:
 import numpy as np
 import pymc as pm
 
-from transalchemy import compile_model
+from alchemize import compile_model
 
 # --- Synthetic retail sales data ---
 np.random.seed(314)

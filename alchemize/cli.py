@@ -165,7 +165,7 @@ def _transpile(
 
 
 @click.group()
-@click.version_option(package_name="transalchemy")
+@click.version_option(package_name="alchemize")
 def cli():
     """Transalchemy: AI-powered transpilation between computational frameworks."""
 
@@ -210,10 +210,10 @@ def convert(
 
     \b
     Examples:
-      transalchemy convert model.stan --to pymc
-      transalchemy convert train.py --to jax
-      transalchemy convert model.py --to pytorch
-      cat model.stan | transalchemy convert --to pymc
+      alchemize convert model.stan --to pymc
+      alchemize convert train.py --to jax
+      alchemize convert model.py --to pytorch
+      cat model.stan | alchemize convert --to pymc
     """
     # Read input
     if input_file:
@@ -224,7 +224,7 @@ def convert(
         filename = "stdin"
     else:
         raise click.UsageError(
-            "No input file provided and no data on stdin. Usage: transalchemy convert <file> --to <framework>"
+            "No input file provided and no data on stdin. Usage: alchemize convert <file> --to <framework>"
         )
 
     target = _normalize_framework(target)
