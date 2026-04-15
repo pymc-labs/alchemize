@@ -79,11 +79,25 @@ minGPT-nano (3 layers, 3 heads, 48-dim embeddings) transpiled to zero-dependency
 
 Forward pass numerical accuracy: max_diff = 5.36e-07. Enzyme gradients match PyTorch autograd to ~5e-7 (f32 precision).
 
+## Install
+
+```bash
+pip install alchemize-ai
+```
+
+> Note: the PyPI distribution name is `alchemize-ai` (the `alchemize` name was taken by an abandoned package), but the import name is still `alchemize`:
+>
+> ```python
+> from alchemize import compile_model
+> ```
+
+The CLI command is also `alchemize`.
+
 ## Quick start
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-uv sync  # or: pip install -e .
+pip install alchemize-ai  # or, for development: uv sync / pip install -e .
 ```
 
 ```python
