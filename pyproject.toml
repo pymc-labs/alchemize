@@ -1,5 +1,5 @@
 [project]
-name = "alchemize"
+name = "alchemize-ai"
 version = "0.1.0"
 description = "The Transalchemy: an AI agent that transpiles between any computational framework via LLM"
 authors = [{name = "Thomas Wiecki", email = "thomas.wiecki@pymc-labs.com"}]
