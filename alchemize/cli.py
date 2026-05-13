@@ -1,4 +1,4 @@
-"""CLI for the Transalchemy — AI-powered transpilation between computational frameworks."""
+"""CLI for Alchemize — AI-powered transpilation between computational frameworks."""
 
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def _load_skills(source: str, target: str) -> str:
 
 
 _SYSTEM_PROMPT = """\
-You are the Transalchemy — an expert AI that transpiles code between computational \
+You are Alchemize — an expert AI that transpiles code between computational \
 frameworks. You produce clean, idiomatic code in the target framework that is \
 functionally equivalent to the input.
 
@@ -167,7 +167,7 @@ def _transpile(
 @click.group()
 @click.version_option(package_name="alchemize")
 def cli():
-    """Transalchemy: AI-powered transpilation between computational frameworks."""
+    """Alchemize: AI-powered transpilation between computational frameworks."""
 
 
 @cli.command()

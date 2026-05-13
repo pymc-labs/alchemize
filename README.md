@@ -1,4 +1,4 @@
-# Transalchemy
+# Alchemize
 
 An AI agent that acts as a compiler for computational models. It transpiles between probabilistic programming languages (PyMC, Stan), deep learning frameworks (JAX, PyTorch), and compiles to optimized Rust — with numerical validation at every step.
 
