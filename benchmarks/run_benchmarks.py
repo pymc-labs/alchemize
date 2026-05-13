@@ -828,7 +828,7 @@ def main():
         ]
 
     print("=" * 72)
-    print("  Transalchemy Benchmark Suite: PyMC vs Stan vs Rust")
+    print("  Alchemize Benchmark Suite: PyMC vs Stan vs Rust")
     print("=" * 72)
     print(f"  Models: {', '.join(model_names)}")
     print(f"  Config: {args.draws} draws, {args.tune} tune, {args.chains} chains")

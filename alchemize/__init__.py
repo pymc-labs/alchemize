@@ -1,4 +1,4 @@
-"""Transalchemy: compile and transpile models across frameworks via LLM.
+"""Alchemize: compile and transpile models across frameworks via LLM.
 
 Supports: PyMC/Stan → Rust, Stan → PyMC, JAX ↔ PyTorch.
 """
