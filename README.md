@@ -2,7 +2,7 @@
 
 An AI agent that acts as a compiler for computational models. It transpiles between probabilistic programming languages (PyMC, Stan), deep learning frameworks (JAX, PyTorch), and compiles to optimized Rust — with numerical validation at every step.
 
-**[Read the blog post →](https://twiecki.io/blog/2026/03/10/alchemize/)**
+**[Read the blog post →](https://www.pymc-labs.com/blog-posts/llm-transpiler-pymc-to-rust)**
 
 ## How it works
 
