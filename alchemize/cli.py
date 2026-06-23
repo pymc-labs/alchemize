@@ -13,6 +13,7 @@ _SKILLS_DIR = Path(__file__).parent / "skills"
 
 # Mapping from (source, target) pairs to relevant skill files
 _SKILL_MAP: dict[tuple[str, str], list[str]] = {
+    ("gguf", "pytensor"): ["gguf_to_pytensor.md"],
     ("stan", "pymc"): ["stan_to_pymc.md"],
     ("stan", "rust"): ["stan.md"],
     ("pymc", "rust"): ["pymc_optimization.md"],
@@ -29,6 +30,10 @@ _ALIASES: dict[str, str] = {
     "tf": "tensorflow",
     "torch": "pytorch",
     "pt": "pytorch",
+    "ggml": "gguf",
+    "gguf": "gguf",
+    "ptensor": "pytensor",
+    "pytensor": "pytensor",
     "rs": "rust",
     "turing": "turing.jl",
     "brms": "brms",
@@ -39,6 +44,7 @@ _EXT_MAP: dict[str, str] = {
     ".stan": "stan",
     ".bug": "bugs",
     ".bugs": "bugs",
+    ".gguf": "gguf",
     ".jl": "julia",
     ".r": "r",
     ".R": "r",
@@ -96,6 +102,7 @@ functionally equivalent to the input.
 Supported frameworks include (but are not limited to):
 - Probabilistic programming: Stan, PyMC, NumPyro, Turing.jl, BUGS, brms
 - Deep learning: PyTorch, JAX, TensorFlow
+- Model weight formats / tensor graphs: GGUF, PyTensor
 - Systems: Rust, C++
 
 Rules:
@@ -213,13 +220,27 @@ def convert(
       alchemize convert model.stan --to pymc
       alchemize convert train.py --to jax
       alchemize convert model.py --to pytorch
+      alchemize convert model.gguf --to pytensor
       cat model.stan | alchemize convert --to pymc
     """
+    source_hint = _normalize_framework(source) if source else None
+
     # Read input
     if input_file:
-        code = Path(input_file).read_text()
-        filename = Path(input_file).name
+        path = Path(input_file)
+        filename = path.name
+        if source_hint == "gguf" or (source_hint is None and path.suffix.lower() == ".gguf"):
+            from alchemize.gguf_exporter import GGUFParseError, build_gguf_prompt
+
+            try:
+                code = build_gguf_prompt(path)
+            except GGUFParseError as exc:
+                raise click.ClickException(str(exc)) from exc
+        else:
+            code = path.read_text()
     elif not sys.stdin.isatty():
+        if source_hint == "gguf":
+            raise click.UsageError("GGUF input must be provided as a file path, not stdin.")
         code = sys.stdin.read()
         filename = "stdin"
     else:
@@ -230,8 +251,8 @@ def convert(
     target = _normalize_framework(target)
 
     # Detect source framework
-    if source:
-        source = _normalize_framework(source)
+    if source_hint:
+        source = source_hint
     else:
         source = _detect_framework(code, filename)
         if verbose:
