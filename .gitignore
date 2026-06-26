@@ -13,6 +13,9 @@ Cargo.lock
 # Secrets
 .env
 
+# Downloaded model artifacts
+models/*.gguf
+
 # IDE
 .vscode/
 .idea/
